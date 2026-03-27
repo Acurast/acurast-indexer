@@ -1,0 +1,664 @@
+indexer:
+  archive_nodes:
+    - public-archive.mainnet.acurast.com
+  index_finalized: true
+  index_backwards: true
+  index_phases: true
+  index_from_block: 0
+  index_from_epoch: 0
+  num_workers_backwards: 8
+  num_workers_gaps: 1
+  num_workers_finalized: 2
+  num_workers_phases: 35
+  num_event_queuers: 5
+  num_conn_phases: 30
+  num_db_conn_phases: 60
+  max_blocks_per_bulk_insert: 100
+  # reprocess:
+  #   blocks:
+  #     - "0x9204531e0d72a019b3375320d153dda1dba5517ece9b95051e5b5ac9b137f775"
+  #   events:
+  #     - block_number: 8531510
+  #       extrinsic_index: 2
+  #       index: 5
+  #       phase: 1
+  # Indexing rules - each rule defines:
+  # - Which extrinsics trigger storage reads (at end of block)
+  # - Which storage items to read
+  storage_indexing:
+    # ============================================
+    # Job Registration Tracking
+    # ============================================
+    - name: "job_registration_stored"
+      description: "Capture job details when registered"
+
+      trigger:
+        type: event
+        pallet: 40  # Acurast
+        variant: 9  # JobRegistrationStoredV2
+
+      storage:
+        # Event structure: JobRegistrationStoredV2(JobId<T::AccountId>) where JobId = (MultiOrigin, JobIdSequence)
+        - pallet: 40
+          storage_location: "StoredJobRegistration"
+          key_paths:
+            - "[0]"  # MultiOrigin (first part of JobId)
+            - "[1]"  # JobIdSequence (second part of JobId)
+
+    # ============================================
+    # Job Registration Removed
+    # ============================================
+    - name: "job_registration_removed"
+      description: "Capture job removal (stores null when job is removed)"
+
+      trigger:
+        type: event
+        pallet: 40  # Acurast
+        variant: 1  # JobRegistrationRemoved
+
+      storage:
+        - pallet: 40
+          storage_location: "StoredJobRegistration"
+          key_paths:
+            - "[0]"  # MultiOrigin
+            - "[1]"  # JobIdSequence
+
+    # ============================================
+    # Compute Pallet - Commitment Tracking
+    # ============================================
+    - name: "compute_committed"
+      description: "Capture commitments and compute commitment metrics when committed"
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 9  # ComputeCommitted
+      storage:
+        # Commitments: StorageMap<CommitmentId, Commitment>
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - ""  # commitment_id at root
+        # ComputeCommitments: StorageDoubleMap<CommitmentId, PoolId, Metric>
+        # Using partial key to iterate all pools for this commitment
+        - pallet: 48
+          storage_location: "ComputeCommitments"
+          key_paths:
+            - ""  # commitment_id at root (partial key, iterates pools)
+        # System::Account for committer's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "ORIGIN"  # committer who signed the tx
+          value_path: "data"
+
+    - name: "stake_more"
+      description: "Capture commitment when staked more"
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 10  # StakedMore
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - ""  # commitment_id at root
+        - pallet: 48
+          storage_location: "ComputeCommitments"
+          key_paths:
+            - ""  # commitment_id at root (partial key, iterates pools)
+        # System::Account for committer's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "ORIGIN"  # committer who signed the tx
+          value_path: "data"
+
+    - name: "stake_more_metrics"
+      description: "Capture compute commitment when staked more"
+      phase: 5
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 10  # StakedMore
+      storage:
+        - pallet: 48
+          storage_location: "ComputeCommitments"
+          key_paths:
+            - ""  # commitment_id at root (partial key, iterates pools)
+
+    - name: "compute_commitment_cooldown_started"
+      description: "Capture commitment when cooldown starts"
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 11  # ComputeCommitmentCooldownStarted
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - ""  # commitment_id at root
+        # System::Account for committer's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "ORIGIN"  # committer who signed the tx
+          value_path: "data"
+
+    - name: "compute_commitment_ended"
+      description: "Capture commitment when ended (stores it with null in commitment.stake)"
+      phase: 4
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 12  # ComputeCommitmentEnded
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - ""  # commitment_id at root (hex string like "0x7200")
+        # System::Account for committer's balance (unlocked stake)
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "ORIGIN"  # committer who signed the tx
+          value_path: "data"
+
+    - name: "slashed"
+      description: "Capture commitment when slashed"
+      phase: 3  # Process during StorageIndexed3 since previously configured with wrong pallet/variant
+      trigger:
+        type: event
+        pallet: 48  # AcurastCompute
+        variant: 14  # Slashed
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - ""  # commitment_id at root
+        # System::Account for slashed account's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - ""  # commitment_id at root, to be used to lookup owner of commitment
+          transform: "CommitmentIdToCommitter"
+          value_path: "data"
+
+    # ============================================
+    # Compute Pallet - Delegation Tracking
+    # ============================================
+    - name: "delegated"
+      description: "Capture delegation when created"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: Delegated { delegator, commitment_id }
+        variant: 5
+      storage:
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "delegated_more"
+      description: "Capture delegation when delegated more"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: DelegatedMore { delegator, commitment_id }
+        variant: 6
+      storage:
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "delegation_cooldown_started"
+      description: "Capture delegation when cooldown started"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: DelegationCooldownStarted { delegator, commitment_id }
+        variant: 7
+      storage:
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "delegation_ended"
+      description: "Capture delegation when ended (stores null)"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: DelegationEnded { delegator, commitment_id }
+        variant: 8
+      storage:
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance (unlocked)
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "redelegated"
+      description: "Capture delegation, both old (stores null) and new, and both involved commitments"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: Redelegated { delegator, old_commitment_id, new_commitment_id }
+        variant: 15
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - "[1]"  # old_commitment_id
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - "[2]"  # new_commitment_id
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # old_commitment_id (for lookup deletion)
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[2]"  # new_commitment_id (for lookup)
+        # System::Account for delegator's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "delegator_withdrew"
+      description: "Capture delegation after withdrew"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: DelegatorWithdrew {delegator, commitment_id, ... }
+        variant: 16
+      storage:
+        - pallet: 48
+          storage_location: "Delegations"
+          key_paths:
+            - "[0]"  # delegator
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance (received rewards)
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+    
+    - name: "committer_withdrew"
+      description: "Capture commitment after committer withdrew"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: CommitterWithdrew {committer, commitment_id, ... }
+        variant: 17
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - "[1]"  # commitment_id
+        # System::Account for committer's balance (received rewards)
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # committer
+          value_path: "data"
+
+    - name: "delegator_compounded"
+      description: "Capture commitment after delegator compounded"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: DelegatorCompounded {delegator, commitment_id, ... }
+        variant: 18
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - "[1]"  # commitment_id
+        # System::Account for delegator's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # delegator
+          value_path: "data"
+
+    - name: "committer_compounded"
+      description: "Capture commitment after committer compounded"
+      trigger:
+        type: event
+        # Pallet "AcurastCompute"
+        pallet: 48
+        # Event structure: CommitterCompounded {committer, commitment_id, ... }
+        variant: 19
+      storage:
+        - pallet: 48
+          storage_location: "Commitments"
+          key_paths:
+            - "[1]"  # commitment_id
+        # System::Account for committer's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # committer
+          value_path: "data"
+
+    # ============================================
+    # Processor Metrics Tracking
+    # ============================================
+    - name: "processor_heartbeat_metrics"
+      description: "Capture all pool metrics for processor on heartbeat"
+
+      trigger:
+        type: event
+        # Pallet "AcurastProcessorManager"
+        pallet: 41
+        # Event structure: ProcessorHeartbeatWithVersion { ... }
+        variant: 6
+
+      storage:
+        - pallet: 48
+          storage_location: "Metrics"
+          # Only provide the first key (processor account from origin)
+          # to iterate all pools for this processor
+          key_paths:
+            - "ORIGIN"
+
+      # Pruning configuration: keep only last 50000 blocks (~1 weeks at 6s block time)
+      # Snapshots older than this will be deleted periodically and won't be indexed during catchup
+      pruning:
+        strategy: keep_blocks
+        blocks: 100000
+
+    - name: "manager_metrics_epoch_sum"
+      description: "Capture the sum of pool metrics per manager"
+      phase: 3
+      trigger:
+        type: epoch
+
+      storage:
+        - pallet: 48  # AcurastCompute
+          storage_location: "MetricsEpochSum"
+          # No key paths - iterates all entries, grouped by first key (commitment_id)
+          # Each commitment_id gets its own row with {pool_id: metric, ...} as data
+          group_by_first_key: true
+
+      # Pruning configuration: keep only last 50000 blocks (~1 weeks at 6s block time)
+      # Snapshots older than this will be deleted periodically and won't be indexed during catchup
+      pruning:
+        strategy: keep_blocks
+        blocks: 90000 # corresponds to 100 epochs
+
+    # ============================================
+    # Epoch Storage Reads
+    # ============================================
+    - name: "stake_based_rewards_snapshot"
+      description: "Capture StakeBasedRewards (target_weight_per_compute) for all pools at epoch start"
+
+      trigger:
+        type: epoch
+
+      storage:
+        # StakeBasedRewards: StorageMap<PoolId, SlidingBuffer<Epoch, RewardBudget>>
+        # RewardBudget contains target_weight_per_compute
+        # Empty key_paths iterates all pool_ids
+        - pallet: 48  # AcurastCompute
+          storage_location: "StakeBasedRewards"
+          key_paths: []
+
+    - name: "total_issuance"
+      description: "Capture total issuance at epoch start"
+
+      phase: 4
+      trigger:
+        type: epoch
+      epoch_snapshot_at: "both" # Capture at both start and end of epoch to track changes within epoch (e.g. due to slashing)
+
+      storage:
+        # StakeBasedRewards: StorageMap<PoolId, SlidingBuffer<Epoch, RewardBudget>>
+        # RewardBudget contains target_weight_per_compute
+        # Empty key_paths iterates all pool_ids
+        - pallet: 10  # Balances
+          storage_location: "TotalIssuance"
+          key_paths: []
+        - pallet: 10  # Balances
+          storage_location: "InactiveIssuance"
+          key_paths: []
+
+    # ============================================
+    # Token Claim Pallet - Claim & Vesting Tracking
+    # ============================================
+    - name: "token_claimed"
+      description: "Capture claim info for legacy Claimed event"
+      phase: 3
+      trigger:
+        type: event
+        pallet: 55  # AcurastTokenClaim
+        variant: 0  # Claimed (legacy, may not be emitted)
+      storage:
+        # Claimed: StorageMap<AccountId, ProcessedClaim>
+        - pallet: 55
+          storage_location: "Claimed"
+          key_paths:
+            - "[0]"  # account (claimer)
+        # System::Account for claimer's balance
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]"  # account
+          value_path: "data"
+
+    - name: "token_claimed_v2"
+      description: "Capture claim and vesting info when ClaimedV2 event fires"
+      phase: 3
+      trigger:
+        type: event
+        pallet: 55  # AcurastTokenClaim
+        variant: 1  # ClaimedV2
+      storage:
+        # Claimed: StorageMap<AccountId, ProcessedClaim>
+        - pallet: 55
+          storage_location: "Claimed"
+          key_paths:
+            - "[0]"  # claimer
+        # Vesting: StorageDoubleMap<destination, claimer, VestingInfo>
+        - pallet: 55
+          storage_location: "Vesting"
+          key_paths:
+            - "[1]"  # destination
+            - "[0]"  # claimer
+        # System::Account for destination's balance after claim
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[1]"  # destination
+          value_path: "data"
+
+    - name: "token_vested"
+      description: "Capture vesting info after funds are unlocked"
+      phase: 3
+      trigger:
+        type: event
+        pallet: 55  # AcurastTokenClaim
+        variant: 2  # Vested
+      storage:
+        # Vesting: StorageDoubleMap<destination, claimer, VestingInfo>
+        # May be deleted if fully vested (will store null)
+        - pallet: 55
+          storage_location: "Vesting"
+          key_paths:
+            - "[1]"  # destination
+            - "[0]"  # claimer
+        # System::Account for destination's balance after vest
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[1]"  # destination
+          value_path: "data"
+
+  event_transformations:
+    1:
+      - pallet: 40 # Acurast
+        variant: 0 # JobRegistrationStored
+        data_path: "[1]" # Extract job_id from event data
+      - pallet: 40 # Acurast
+        variant: 1 # JobRegistrationRemoved
+        data_path: "" # job_id is the whole event data
+      - pallet: 40 # Acurast
+        variant: 2 # AllowedSourcesUpdated
+        data_path: "[0]" # Extract job_id from first field
+      - pallet: 40 # Acurast
+        variant: 5 # ExecutionEnvironmentsUpdated
+        data_path: "[0]" # Extract job_id
+      - pallet: 40 # Acurast
+        variant: 9 # JobRegistrationStoredV2
+        data_path: "" # job_id is the whole event data
+      - pallet: 40 # Acurast
+        variant: 10 # AllowedSourcesUpdatedV2
+        data_path: "" # job_id is the whole event data
+      - pallet: 40 # Acurast
+        variant: 12 # ExecutionEnvironmentsUpdatedV2
+        data_path: "" # job_id is the whole event data
+      - pallet: 43 # AcurastMarketplace
+        variant: 0 # JobRegistrationMatched
+        data_path: "[0].job_id" # Extract job_id from Match struct
+      - pallet: 43 # AcurastMarketplace
+        variant: 1 # JobRegistrationAssigned
+        data_path: "[0]" # Extract job_id (first field)
+      - pallet: 43 # AcurastMarketplace
+        variant: 2 # Reported
+        data_path: "[0]" # Extract job_id
+      - pallet: 43 # AcurastMarketplace
+        variant: 5 # AdvertisementRemoved
+        data_path: "[0]" # Extract account_id
+      - pallet: 43 # AcurastMarketplace
+        variant: 6 # ExecutionSuccess
+        data_path: "[0]" # Extract job_id
+      - pallet: 43 # AcurastMarketplace
+        variant: 7 # ExecutionFailure
+        data_path: "" # job_id is in first field
+      - pallet: 43 # AcurastMarketplace
+        variant: 8 # JobFinalized
+        data_path: "[0].job_id" # Extract job_id
+      - pallet: 43 # AcurastMarketplace
+        variant: 9 # JobExecutionMatched
+        data_path: "" # ExecutionMatch struct
+      - pallet: 43 # AcurastMarketplace
+        variant: 10 # JobScriptEdited
+        data_path: "[0]" # Extract job_id
+      - pallet: 43 # AcurastMarketplace
+        variant: 11 # EditorTransferred
+        data_path: "" # job_id in first field
+      - pallet: 43 # AcurastMarketplace
+        variant: 13 # JobRegistrationMatchedV2
+        data_path: ""
+      - pallet: 43 # AcurastMarketplace
+        variant: 14 # JobRegistrationAssignedV2
+        data_path: "[0]"
+      - pallet: 43 # AcurastMarketplace
+        variant: 15 # ReportedV2
+        data_path: "[0]"
+      - pallet: 43 # AcurastMarketplace
+        variant: 17 # JobExecutionMatchedV2
+        data_path: ""
+  extrinsic_transformations:
+    1:
+      - pallet: 40 # set_environment
+        method: 7
+        data_path: "[1]"
+      - pallet: 40 # set_environments
+        method: 8
+        data_path: "[1].[].[0]"
+      - pallet: 43 # propose_execution_matching
+        method: 7
+        data_path: "[].sources.[].source"
+      - pallet: 43 # propose_matching
+        method: 2
+        data_path: "[].sources.[].source"
+      - pallet: 10 # transfer_allow_death
+        method: 0
+        data_path: "[0]"
+      - pallet: 10 # transfer_keep_alive
+        method: 3
+        data_path: "[0]"
+      # AcurastProcessorManager (pallet 41) extrinsics
+      - pallet: 41 # update_processor_pairings
+        method: 0
+        data_path: "[0].[].item.account"
+      - pallet: 41 # pair_with_manager
+        method: 1
+        data_path: "[0].account"
+      - pallet: 41 # recover_funds (processor)
+        method: 2
+        data_path: "[0]"
+      - pallet: 41 # recover_funds (destination)
+        method: 2
+        data_path: "[1]"
+      - pallet: 41 # advertise_for
+        method: 4
+        data_path: "[0]"
+      - pallet: 41 # set_processor_update_info
+        method: 8
+        data_path: "[1].[]"
+      - pallet: 41 # multi_pair_with_manager
+        method: 12
+        data_path: "[0].account"
+      - pallet: 41 # onboard
+        method: 14
+        data_path: "[0].account"
+server:
+  port: 8000
+  host: 127.0.0.1
+  query_timeout_seconds: 10
+  num_db_connections: 100
+auth:
+  # Set via API_KEY environment variable
+  api_key: ""
+database:
+  username: postgres
+  password: postgres
+  host: localhost
+  port: 5433
+  database: acurast

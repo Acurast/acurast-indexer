@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT sv.spec_version, sv.block_number, b.hash as block_hash\n                FROM spec_versions sv\n                JOIN blocks b ON sv.block_number = b.block_number\n                WHERE sv.spec_version = $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spec_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "block_number",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "block_hash",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9f8b9653cda22dfd3b701be71860d193a389202227e531bb0c12d143f6ed405e"
+}

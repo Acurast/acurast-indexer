@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE spec_versions SET metadata = $1 WHERE spec_version = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bf9922daa727c5f7a9c355e9c5dc6064c74c87664ac32865ca694d0916e50826"
+}

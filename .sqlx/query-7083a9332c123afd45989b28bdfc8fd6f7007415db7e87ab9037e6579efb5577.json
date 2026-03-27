@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO spec_versions (spec_version, block_number, block_time, metadata)\n                VALUES ($1, $2, $3, $4)\n                ON CONFLICT (spec_version) DO UPDATE\n                SET block_number = LEAST(EXCLUDED.block_number, spec_versions.block_number),\n                    block_time = CASE WHEN EXCLUDED.block_number < spec_versions.block_number THEN EXCLUDED.block_time ELSE spec_versions.block_time END,\n                    metadata = COALESCE(spec_versions.metadata, EXCLUDED.metadata)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int8",
+        "Timestamptz",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7083a9332c123afd45989b28bdfc8fd6f7007415db7e87ab9037e6579efb5577"
+}

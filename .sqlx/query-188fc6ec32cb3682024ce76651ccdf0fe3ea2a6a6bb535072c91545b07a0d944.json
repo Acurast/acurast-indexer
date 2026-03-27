@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT hash, block_time FROM blocks WHERE block_number = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "block_time",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "188fc6ec32cb3682024ce76651ccdf0fe3ea2a6a6bb535072c91545b07a0d944"
+}

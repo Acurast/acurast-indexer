@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS public.epochs CASCADE;
+DROP TABLE IF EXISTS public.storage_snapshots CASCADE;
+DROP TABLE IF EXISTS public.extrinsic_address CASCADE;
+DROP TABLE IF EXISTS public.jobs CASCADE;
+DROP TYPE IF EXISTS target_chain CASCADE;
+DROP TABLE IF EXISTS public.events CASCADE;
+DROP TABLE IF EXISTS public.extrinsics CASCADE;
+DROP TABLE IF EXISTS public.spec_versions CASCADE;
+DROP TABLE IF EXISTS public.blocks CASCADE;
+DROP EXTENSION IF EXISTS btree_gin;
+DROP TABLE IF EXISTS public.managers;

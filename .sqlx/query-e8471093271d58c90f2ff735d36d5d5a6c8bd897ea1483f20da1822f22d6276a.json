@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ordered_blocks AS (\n            SELECT block_number, \"hash\", LEAD(block_number) OVER (ORDER BY block_number) AS next_block_number,\n                    LEAD(\"hash\") OVER (ORDER BY block_number) AS next_low_hash\n            FROM blocks\n            WHERE block_number > ($1) AND block_number < ($2)\n            ORDER BY block_number desc\n            )\n            SELECT\n                block_number + 1 AS start,\n                next_low_hash\n            FROM ordered_blocks\n            WHERE next_block_number IS NOT NULL AND next_block_number - block_number > 1\n            LIMIT 1000;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "start",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "next_low_hash",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "e8471093271d58c90f2ff735d36d5d5a6c8bd897ea1483f20da1822f22d6276a"
+}

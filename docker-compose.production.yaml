@@ -1,0 +1,49 @@
+version: '3'
+
+services:
+  app:
+    image: acurast/acurast-indexer:latest  # Replace with your image
+    command: ["acurast-indexer", "-e", "production"]
+    ports:
+      - 8000:8000
+    volumes:
+      - ./configuration/production.yaml:/app/configuration/production.yaml
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health | grep -q '\"live\":true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      - "autoheal=true"
+  autoheal:
+    image: willfarrell/autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  db:
+    image: postgres:16
+    volumes:
+      - psql:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: acurast
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  psql:
+    external: false

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT block_number, '0x' || \"hash\" as \"hash!\", block_time FROM blocks WHERE \"hash\" = ($1) LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "block_number",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "hash!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "block_time",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "30f5445de91839ce709b6766e4d69faf4cd370a1378c709a2c0175b88a8c4cb4"
+}

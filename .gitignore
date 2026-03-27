@@ -1,0 +1,13 @@
+/target
+/configuration/local.yml
+integration_tests/target
+
+# Docker-specific configuration for local development
+/docker_config
+.env
+.vscode/
+scripts/
+configuration/local.yaml
+
+bin/
+pkg/

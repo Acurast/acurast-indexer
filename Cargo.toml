@@ -1,0 +1,53 @@
+[package]
+name = "acurast-indexer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "1.0.97", features = ["backtrace"]}
+axum = { version = "0.8.1", features = ["multipart", "tokio", "http2"] }
+axum-macros = "0.5.0"
+base64 = "0.22.1"
+chrono = { version = "0.4.40", default-features = false, features = ["serde"] }
+clap = { version = "4.5.31", features = ["derive", "env"] }
+config = "0.15.9"
+derive_more = { version = "2.0.1", features = ["full"] }
+dotenvy = { version = "0.15.6", features = ["clap"] }
+serde = { version = "1", features = ["derive"] }
+hex = { version = "0.4.3" }
+serde-hex = "0.1.0"
+serde_json = "1"
+sqlx = { version = "0.8.3", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "bigdecimal"] }
+thiserror = "2.0.12"
+tokio = { version = "1.23", features = ["full"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.2", features = ["cors", "tracing", "trace", "fs"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-bunyan-formatter = "0.3.6"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "registry"] }
+uuid = { version = "1.15.1", features = [
+    "serde",
+    "v4",
+    "fast-rng",
+    "macro-diagnostics",
+] }
+validator = { version = "0.20.0", features = ["derive"] }
+subxt = { version = "0.44", features = ["reconnecting-rpc-client"] }
+tokio-util = { version = "0.7.13", features = ["rt"] }
+async-channel = "2.3.1"
+once_cell = "1.21.3"
+parking_lot = "0.12"
+scale-info = { version = "2.11.6", features = ["derive"] }
+scale-value = "0.18.0"
+parity-scale-codec = { version = "3", features = ["derive"] }
+num-bigint = "0.4.6"
+bigdecimal = { version = "0.4", features = ["serde"] }
+backoff = { version = "0.4.0", features = ["tokio"] }
+moka = { version = "0.12", features = ["future"] }
+
+[dev-dependencies]
+sqlx-cli = "0.8.3"
+reqwest = { version = "0.12", features = ["json"] }
