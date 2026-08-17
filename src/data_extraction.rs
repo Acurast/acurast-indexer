@@ -9,23 +9,75 @@ pub fn extract<'a>(
     path: &str,
 ) -> Result<(String, String, i32), anyhow::Error> {
     let results = resolve_json_path(json, path)?;
-    if let Some(e) = results.first() {
-        let e = e.as_array().unwrap();
+    let e = results
+        .first()
+        .ok_or_else(|| anyhow!("could not find path {:?} in event.data", path))?;
+    let arr = e
+        .as_array()
+        .ok_or_else(|| anyhow!("expected JobId tuple at path {:?}, got {}", path, e))?;
+    let origin = arr
+        .first()
+        .ok_or_else(|| anyhow!("JobId tuple at path {:?} is empty", path))?;
+    let seq_id_raw = arr
+        .get(1)
+        .ok_or_else(|| anyhow!("JobId tuple at path {:?} missing sequence id", path))?;
 
-        let (chain, address) = if e[0].is_object() {
-            let (key, value) = e[0].as_object().unwrap().into_iter().next().unwrap();
-            (key.to_owned(), value.as_str().unwrap().to_owned())
-        } else {
-            ("Acurast".to_owned(), e[0].as_str().unwrap().to_owned())
-        };
-        Ok((
-            chain,
-            address,
-            e[1].as_str().unwrap().parse::<i32>().unwrap(),
-        ))
-    } else {
-        Err(anyhow!("could not find path {:?} in event.data", path))
-    }
+    let (chain, address) = match origin {
+        // Tagged enum variant: {"Acurast": "0x..."} / {"Tezos": "..."} / etc.
+        Value::Object(obj) => {
+            let (key, value) = obj
+                .iter()
+                .next()
+                .ok_or_else(|| anyhow!("MultiOrigin object at {:?} is empty", path))?;
+            let addr = value
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "MultiOrigin {} variant at {:?} expected string address, got {}",
+                        key,
+                        path,
+                        value
+                    )
+                })?
+                .to_owned();
+            (key.to_owned(), addr)
+        }
+        // Bare string — legacy shape; assume Acurast chain.
+        Value::String(s) => ("Acurast".to_owned(), s.clone()),
+        other => {
+            return Err(anyhow!(
+                "MultiOrigin at path {:?} has unexpected shape: {}",
+                path,
+                other
+            ));
+        }
+    };
+
+    // Sequence id may be encoded as either a JSON number (small u32/u64)
+    // or a string (large u128, hex, etc.).
+    let seq_id = match seq_id_raw {
+        Value::Number(n) => n
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| anyhow!("seq_id at {:?} out of i32 range: {}", path, n))?,
+        Value::String(s) => s.parse::<i32>().map_err(|err| {
+            anyhow!(
+                "seq_id at {:?} could not be parsed as i32: {} ({})",
+                path,
+                s,
+                err
+            )
+        })?,
+        other => {
+            return Err(anyhow!(
+                "seq_id at path {:?} has unexpected shape: {}",
+                path,
+                other
+            ));
+        }
+    };
+
+    Ok((chain, address, seq_id))
 }
 
 /// Extract account address from a value, handling MultiAddress enum with "Id" field

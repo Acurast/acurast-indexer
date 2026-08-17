@@ -18,10 +18,43 @@ export interface QueueTypeMetrics {
   items_processed: number
 }
 
+export interface DbEntityMetrics {
+  entity: string
+  rows_per_sec: number
+  total_rows: number
+}
+
+export interface DbMetrics {
+  entities: DbEntityMetrics[]
+  total_rows_per_sec: number
+  total_rows: number
+}
+
+export interface NodeMetrics {
+  url: string
+  calls_per_sec: number
+  total_calls: number
+}
+
+export interface BlockChannelMetrics {
+  name: string
+  pending: number
+}
+
+export interface RangeMetric<T> {
+  min: T
+  max: T
+}
+
 export interface QueueMetrics {
   events: QueueTypeMetrics
   extrinsics: QueueTypeMetrics
   epochs: QueueTypeMetrics
+  db: DbMetrics
+  nodes: NodeMetrics[]
+  block_channels: BlockChannelMetrics[]
+  block_range?: RangeMetric<number>
+  epoch_range?: RangeMetric<number>
   updated_at: number
 }
 
@@ -34,9 +67,22 @@ export interface Task {
   current_work: CurrentWork
 }
 
+export interface MetricsHistoryPoint {
+  t: number
+  events: number
+  extrinsics: number
+  epochs: number
+  db_total: number
+  db_by_entity: Record<string, number>
+  nodes_by_url: Record<string, number>
+}
+
+const HISTORY_LIMIT = 120 // ~6 minutes at 3s polling
+
 interface TaskState {
   tasks: Task[]
   queueMetrics: QueueMetrics | null
+  metricsHistory: MetricsHistoryPoint[]
   isLoading: boolean
   error: string | null
   lastUpdated: number | null
@@ -52,6 +98,7 @@ interface TaskState {
 export const useTaskStore = create<TaskState>((set, _get) => ({
   tasks: [],
   queueMetrics: null,
+  metricsHistory: [],
   isLoading: false,
   error: null,
   lastUpdated: null,
@@ -87,8 +134,24 @@ export const useTaskStore = create<TaskState>((set, _get) => ({
       if (!res.ok) {
         throw new Error(`Failed to fetch queue metrics: ${res.status}`)
       }
-      const data = await res.json()
-      set({ queueMetrics: data })
+      const data: QueueMetrics = await res.json()
+      const point: MetricsHistoryPoint = {
+        t: data.updated_at,
+        events: data.events?.throughput_per_sec ?? 0,
+        extrinsics: data.extrinsics?.throughput_per_sec ?? 0,
+        epochs: data.epochs?.throughput_per_sec ?? 0,
+        db_total: data.db?.total_rows_per_sec ?? 0,
+        db_by_entity: Object.fromEntries(
+          (data.db?.entities ?? []).map(e => [e.entity, e.rows_per_sec])
+        ),
+        nodes_by_url: Object.fromEntries(
+          (data.nodes ?? []).map(n => [n.url, n.calls_per_sec])
+        )
+      }
+      set(state => ({
+        queueMetrics: data,
+        metricsHistory: [...state.metricsHistory, point].slice(-HISTORY_LIMIT)
+      }))
     } catch (e) {
       // Silently fail for queue metrics - not critical
       console.warn('Failed to fetch queue metrics:', e)

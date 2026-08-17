@@ -5,6 +5,7 @@
 //! - Backwards indexing from latest block
 //! - Finalized block subscription
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +13,13 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_channel::Sender;
 use backoff::{future::retry_notify, Error as BackoffError, ExponentialBackoff as Backoff};
+use parity_scale_codec::Decode;
 use sqlx::{query_as, Pool, Postgres};
 use subxt::blocks::BlockRef;
 use subxt::utils::H256;
 use subxt::{OnlineClient, PolkadotConfig};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::entities::ExtrinsicRow;
 use crate::task_monitor::TASK_REGISTRY;
@@ -120,38 +122,69 @@ async fn queue_gaps_(
     first_finalized: u32,
 ) -> Result<(), anyhow::Error> {
     let settings = &crate::config::settings().indexer;
-    let (client, _) = connect_node(settings.archive_nodes[0].clone()).await?;
+    // Each queuer takes a distinct slot so that when multiple archive nodes
+    // are configured, load is distributed instead of all queuers hitting node 0.
+    let node_url = settings.archive_nodes[1 % settings.archive_nodes.len()].clone();
+    crate::utils::with_node_url(node_url.clone(), async move {
+        queue_gaps_inner(
+            task_id,
+            tx,
+            backpressure,
+            db_pool,
+            cancel_token,
+            lowest_done,
+            first_finalized,
+            node_url,
+        )
+        .await
+    })
+    .await
+}
 
-    let mut iteration: u64 = 0;
+#[allow(clippy::too_many_arguments)]
+async fn queue_gaps_inner(
+    task_id: u64,
+    tx: Sender<BlockRef<H256>>,
+    backpressure: Sender<ExtrinsicRow>,
+    db_pool: Pool<Postgres>,
+    cancel_token: CancellationToken,
+    lowest_done: u32,
+    first_finalized: u32,
+    node_url: String,
+) -> Result<(), anyhow::Error> {
+    let settings = &crate::config::settings().indexer;
+    let (client, _) = connect_node(&node_url).await?;
+
     let mut total_gaps_queued: u64 = 0;
 
-    'outer: loop {
-        iteration += 1;
-        let mut gaps_this_iteration: u64 = 0;
+    // Track every block number we've sent into the channel during this run.
+    // An in-flight block (queued but not yet inserted into `blocks` by the
+    // worker) would otherwise look like an unstarted gap when the inner SQL
+    // re-runs and would be re-queued. With this set, we skip the duplicate
+    // RPC parent-hash walk and the duplicate channel send.
+    //
+    // The set lives only for the duration of this single pass. Recovery from
+    // a worker silently dropping a queued block is operator-driven (process
+    // restart re-runs this pass with an empty set).
+    let mut queued_blocks: HashSet<u32> = HashSet::new();
 
-        // First iteration: use first_finalized, subsequent: query highest block from DB
-        let mut page = if iteration == 1 {
-            first_finalized
-        } else {
-            let highest: Option<(i64,)> = sqlx::query_as("SELECT MAX(block_number) FROM blocks")
-                .fetch_optional(&db_pool)
-                .await
-                .map_err(|e| AppError::InternalError(e.into()))?;
-            highest.map(|h| h.0 as u32).unwrap_or(first_finalized)
-        };
+    // Single one-shot pass: walk all gaps from `first_finalized` down to
+    // `lowest_done`. The inner `'inner: loop` exists because the SQL is
+    // `LIMIT 1000` — for large gap counts we need multiple SELECTs, each
+    // narrowing `page` to the lowest gap_start we've processed so far.
+    // No outer re-iteration: when this function returns Ok, the surrounding
+    // `retry_notify` lets the task end. Errors are retried with backoff;
+    // permanent failure surfaces via the existing "stopped permanently" log.
+    let mut page = first_finalized;
+    TASK_REGISTRY.set_detail(
+        task_id,
+        format!("Scanning from block {}, 0 gaps queued", page),
+    );
 
-        TASK_REGISTRY.set_detail(
-            task_id,
-            format!(
-                "Iteration {}, scanning from block {}, {} total gaps queued",
-                iteration, page, total_gaps_queued
-            ),
-        );
-
-        'inner: loop {
-            let gaps = query_as!(
-                Gap,
-                r#"
+    'inner: loop {
+        let gaps = query_as!(
+            Gap,
+            r#"
             WITH ordered_blocks AS (
             SELECT block_number, "hash", LEAD(block_number) OVER (ORDER BY block_number) AS next_block_number,
                     LEAD("hash") OVER (ORDER BY block_number) AS next_low_hash
@@ -166,85 +199,80 @@ async fn queue_gaps_(
             WHERE next_block_number IS NOT NULL AND next_block_number - block_number > 1
             LIMIT 1000;
             "#,
-                lowest_done as i64,
-                page as i64
-            )
-            .fetch_all(&db_pool)
-            .await
-            .map_err(|e| AppError::InternalError(e.into()))?;
+            lowest_done as i64,
+            page as i64
+        )
+        .fetch_all(&db_pool)
+        .await
+        .map_err(|e| AppError::InternalError(e.into()))?;
 
-            if gaps.is_empty() {
-                break 'inner; // No more gaps in this iteration, wait and restart
+        if gaps.is_empty() {
+            break 'inner;
+        }
+
+        for gap in gaps.iter() {
+            if cancel_token.is_cancelled() {
+                return Ok(());
             }
-
-            for gap in gaps.iter() {
-                if cancel_token.is_cancelled() {
-                    break 'outer;
-                }
-                debug!("iterating gap {:?}", gap.start);
-                page = gap.start.unwrap() as u32;
-                if let Some(next_low_hash) = &gap.next_low_hash {
-                    let mut todo: subxt::blocks::Block<
-                        PolkadotConfig,
-                        OnlineClient<PolkadotConfig>,
-                    > = client
+            debug!("iterating gap {:?}", gap.start);
+            let gap_start = gap.start.unwrap() as u32;
+            page = gap_start;
+            if queued_blocks.contains(&gap_start) {
+                debug!(
+                    "Skipping gap starting at {} (already queued this run)",
+                    gap_start
+                );
+                continue;
+            }
+            if let Some(next_low_hash) = &gap.next_low_hash {
+                crate::utils::record_node_rpc_call();
+                let mut todo: subxt::blocks::Block<PolkadotConfig, OnlineClient<PolkadotConfig>> =
+                    client
                         .blocks()
                         .at(H256::from_slice(&hex::decode(next_low_hash).unwrap()))
                         .await?;
-                    while gap.start.map(|s| todo.number() > s as u32).unwrap_or(false) {
-                        // Wait for extrinsic queue to have capacity before queuing more blocks, but at lower backpressure sensitivity than backwards queuer, to indirectly prioritize gaps (will still queue while backwards will not)
-                        while backpressure.len() > 1000 && !cancel_token.is_cancelled() {
-                            debug!("Queue gaps waiting for extrinsic queue capacity");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-
-                        // set to parent (correct because in first iteration it's the lowest already processed)
-                        todo = client.blocks().at(todo.header().parent_hash).await?;
-                        let block_number = todo.number();
-                        tokio::select! {
-                            biased;
-
-                            _ = cancel_token.cancelled() => break 'outer,
-                            result = tx.send(todo.reference()) => {
-                                result?
-                            }
-                        }
-                        gaps_this_iteration += 1;
-                        total_gaps_queued += 1;
-                        TASK_REGISTRY.set_block(task_id, block_number);
-                        TASK_REGISTRY.set_detail(
-                            task_id,
-                            format!(
-                                "Iteration {}, {} gaps this iter, {} total",
-                                iteration, gaps_this_iteration, total_gaps_queued
-                            ),
-                        );
-                        debug!("Queued gap {:?} {:?}", block_number, todo.reference());
+                while todo.number() > gap_start {
+                    // Wait for extrinsic queue to have capacity before queuing more blocks
+                    while backpressure.len() > settings.backpressure_threshold
+                        && !cancel_token.is_cancelled()
+                    {
+                        debug!("Queue gaps waiting for extrinsic queue capacity");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
+
+                    // set to parent (correct because in first iteration it's the lowest already processed)
+                    crate::utils::record_node_rpc_call();
+                    todo = client.blocks().at(todo.header().parent_hash).await?;
+                    let block_number = todo.number();
+                    if queued_blocks.contains(&block_number) {
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+
+                        _ = cancel_token.cancelled() => return Ok(()),
+                        result = tx.send(todo.reference()) => {
+                            result?
+                        }
+                    }
+                    queued_blocks.insert(block_number);
+                    total_gaps_queued += 1;
+                    TASK_REGISTRY.set_block(task_id, block_number);
+                    TASK_REGISTRY.set_detail(task_id, format!("{} gaps queued", total_gaps_queued));
+                    debug!("Queued gap {:?} {:?}", block_number, todo.reference());
                 }
             }
         }
-
-        // Finished scanning, wait 10 seconds before next iteration
-        info!(
-            "Gap scan iteration {} complete: {} gaps queued this iteration, {} total",
-            iteration, gaps_this_iteration, total_gaps_queued
-        );
-        TASK_REGISTRY.set_detail(
-            task_id,
-            format!(
-                "Iteration {} done, {} total gaps. Waiting 5min...",
-                iteration, total_gaps_queued
-            ),
-        );
-
-        tokio::select! {
-            biased;
-            _ = cancel_token.cancelled() => break 'outer,
-            _ = tokio::time::sleep(Duration::from_secs(300)) => {},
-        }
     }
 
+    info!(
+        "Gap scan complete: {} blocks queued, exiting",
+        total_gaps_queued
+    );
+    TASK_REGISTRY.set_detail(
+        task_id,
+        format!("Done: {} gaps queued, exiting", total_gaps_queued),
+    );
     Ok(())
 }
 
@@ -286,63 +314,6 @@ pub async fn queue_parents_of(
     }
     if !cancel_token.is_cancelled() {
         info!("Queued all individual");
-    }
-
-    TASK_REGISTRY.end(task_id);
-    Ok(())
-}
-
-/// Queue specific blocks by hash for reprocessing.
-/// Block hashes should be hex strings (with or without 0x prefix).
-pub async fn queue_reprocess_blocks(
-    tx: Sender<BlockRef<H256>>,
-    block_hashes: Vec<String>,
-    cancel_token: CancellationToken,
-) -> Result<(), anyhow::Error> {
-    if block_hashes.is_empty() {
-        return Ok(());
-    }
-
-    let task_id = TASK_REGISTRY.start("Queue reprocess blocks", None);
-
-    info!("Queueing {} blocks for reprocessing", block_hashes.len());
-
-    for hash_str in block_hashes {
-        // Strip 0x prefix if present
-        let hash_hex = hash_str.strip_prefix("0x").unwrap_or(&hash_str);
-
-        let block_hash = match hex::decode(hash_hex) {
-            Ok(bytes) if bytes.len() == 32 => H256::from_slice(&bytes),
-            Ok(bytes) => {
-                error!(
-                    "Invalid hash length {} for '{}', expected 32 bytes",
-                    bytes.len(),
-                    hash_str
-                );
-                continue;
-            }
-            Err(e) => {
-                error!("Failed to decode hash '{}': {:?}", hash_str, e);
-                continue;
-            }
-        };
-
-        tokio::select! {
-            biased;
-
-            _ = cancel_token.cancelled() => break,
-            result = tx.send(BlockRef::from_hash(block_hash)) => {
-                if let Err(e) = result {
-                    error!("Failed to queue block {:?}: {:?}", block_hash, e);
-                }
-            }
-        }
-
-        info!("Queued block {:?} for reprocessing", block_hash);
-    }
-
-    if !cancel_token.is_cancelled() {
-        info!("Queued all reprocess blocks");
     }
 
     TASK_REGISTRY.end(task_id);
@@ -401,41 +372,64 @@ async fn queue_backwards_(
     cancel_token: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let settings = &crate::config::settings().indexer;
-    let (client, _) = connect_node(settings.archive_nodes[0].clone()).await?;
-    let mut todo: subxt::blocks::Block<PolkadotConfig, OnlineClient<PolkadotConfig>> = lowest_done;
-    while todo.number() > settings.index_from_block {
-        // Wait for extrinsic queue to have capacity before queuing more blocks
-        while backpressure.len() > 100 && !cancel_token.is_cancelled() {
-            debug!("Queue backwards waiting for extrinsic queue capacity");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
-        // set to parent (correct because in first iteration it's the lowest already processed)
-        todo = client.blocks().at(todo.header().parent_hash).await?;
-        let block_number = todo.number();
-        tokio::select! {
-            biased;
-
-            _ = cancel_token.cancelled() => break,
-            result = tx.send(todo.reference()) => {
-                result?
+    let node_url = settings.archive_nodes[0].clone();
+    let (client, _) = connect_node(&node_url).await?;
+    crate::utils::with_node_url(node_url, async move {
+        let settings = &crate::config::settings().indexer;
+        let mut todo: subxt::blocks::Block<PolkadotConfig, OnlineClient<PolkadotConfig>> =
+            lowest_done;
+        while todo.number() > settings.index_from_block {
+            // Wait for extrinsic queue to have capacity before queuing more blocks
+            while backpressure.len() > settings.backpressure_threshold
+                && !cancel_token.is_cancelled()
+            {
+                debug!("Queue backwards waiting for extrinsic queue capacity");
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
+
+            // set to parent (correct because in first iteration it's the lowest already processed)
+            crate::utils::record_node_rpc_call();
+            todo = client.blocks().at(todo.header().parent_hash).await?;
+            let block_number = todo.number();
+            tokio::select! {
+                biased;
+
+                _ = cancel_token.cancelled() => break,
+                result = tx.send(todo.reference()) => {
+                    result?
+                }
+            }
+            TASK_REGISTRY.set_block(task_id, block_number);
+            debug!("Queued backwards {:?} {:?}", block_number, todo.reference());
         }
-        TASK_REGISTRY.set_block(task_id, block_number);
-        debug!("Queued backwards {:?} {:?}", block_number, todo.reference());
-    }
-    if !cancel_token.is_cancelled() {
-        info!("Queued all backwards");
-    }
-    Ok(())
+        if !cancel_token.is_cancelled() {
+            info!("Queued all backwards");
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Hard-coded pallet index for AcurastCompute
+const EPOCH_PALLET: &str = "AcurastCompute";
+/// Hard-coded storage location for current cycle
+const EPOCH_STORAGE: &str = "CurrentCycle";
+
+/// The Cycle struct from AcurastCompute pallet
+#[derive(Debug, Decode)]
+struct Cycle {
+    pub epoch: u32,
+    pub epoch_start: u32,
 }
 
 /// Subscribe to finalized blocks and queue them for processing.
+/// Also detects epoch_start blocks and notifies via epoch_tx for commitment rescans.
 pub async fn on_finalized(
     tx: Sender<BlockRef<H256>>,
     cancel_token: CancellationToken,
     first_finalized_senders: Vec<tokio::sync::oneshot::Sender<(u32, H256)>>,
     latest_finalized: Arc<AtomicU32>,
+    epoch_tx: tokio::sync::mpsc::Sender<(u32, u32, String)>,
 ) {
     let task_id = TASK_REGISTRY.start("Queue finalized", None);
 
@@ -452,12 +446,21 @@ pub async fn on_finalized(
             let c = cancel_token.clone();
             let first_finalized_senders = &first_finalized_senders;
             let latest_finalized = &latest_finalized;
+            let epoch_tx = &epoch_tx;
             async move {
                 if c.is_cancelled() {
                     return Err(BackoffError::permanent(anyhow!("Cancelled")));
                 }
 
-                match on_finalized_(task_id, t, c, first_finalized_senders, latest_finalized).await
+                match on_finalized_(
+                    task_id,
+                    t,
+                    c,
+                    first_finalized_senders,
+                    latest_finalized,
+                    epoch_tx,
+                )
+                .await
                 {
                     Ok(_) => Ok(()),
                     Err(e) => Err(BackoffError::transient(e)),
@@ -488,6 +491,7 @@ async fn on_finalized_(
         Option<tokio::sync::oneshot::Sender<(u32, H256)>>,
     >],
     latest_finalized: &Arc<AtomicU32>,
+    epoch_tx: &tokio::sync::mpsc::Sender<(u32, u32, String)>,
 ) -> Result<(), anyhow::Error> {
     let settings = &crate::config::settings().indexer;
     let (client, _) = connect_node(settings.archive_nodes[0].clone()).await?;
@@ -531,6 +535,14 @@ async fn on_finalized_(
                     }
                 }
 
+                // Check if this is an epoch_start block and notify for commitment rescan
+                if let Err(e) = check_and_notify_epoch_start(&b, epoch_tx).await {
+                    error!(
+                        "Failed to check epoch_start at block {}: {:?}",
+                        block_number, e
+                    );
+                }
+
                 if settings.index_finalized {
                     tokio::select! {
                         biased;
@@ -549,6 +561,54 @@ async fn on_finalized_(
                 );
                 blocks_sub = client.blocks().subscribe_finalized().await?;
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if the given block is an epoch_start block and notify via epoch_tx.
+async fn check_and_notify_epoch_start(
+    block: &subxt::blocks::Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    epoch_tx: &tokio::sync::mpsc::Sender<(u32, u32, String)>,
+) -> Result<(), anyhow::Error> {
+    let block_number = block.number();
+
+    // Fetch CurrentCycle from AcurastCompute pallet
+    let storage_query = subxt::dynamic::storage(
+        EPOCH_PALLET,
+        EPOCH_STORAGE,
+        Vec::<subxt::dynamic::Value>::new(),
+    );
+
+    let cycle = match block.storage().fetch(&storage_query).await {
+        Ok(Some(value)) => Cycle::decode(&mut value.encoded())
+            .map_err(|e| anyhow!("Failed to decode Cycle: {}", e))?,
+        Ok(None) => {
+            // Storage empty, skip
+            return Ok(());
+        }
+        Err(subxt::Error::Metadata(subxt::error::MetadataError::StorageEntryNotFound(_))) => {
+            // Storage doesn't exist at this block
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Check if this block is the epoch_start block
+    if block_number == cycle.epoch_start {
+        let block_hash = hex::encode(block.hash().0);
+        if let Err(e) = epoch_tx.try_send((cycle.epoch, cycle.epoch_start, block_hash.clone())) {
+            debug!(
+                "Failed to send epoch notification for epoch {} at block {}: {:?}",
+                cycle.epoch, block_number, e
+            );
+        } else {
+            trace!(
+                "Sent epoch {} notification at epoch_start block {}",
+                cycle.epoch,
+                cycle.epoch_start
+            );
         }
     }
 

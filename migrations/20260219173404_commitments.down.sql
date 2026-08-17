@@ -10,7 +10,7 @@ DROP INDEX IF EXISTS commitments_stake_rewardable_amount_idx;
 DROP INDEX IF EXISTS commitments_delegations_total_amount_idx;
 DROP INDEX IF EXISTS commitments_commission_idx;
 DROP INDEX IF EXISTS commitments_max_delegation_capacity_idx;
-DROP INDEX IF EXISTS commitments_target_weight_per_compute_idx;
+DROP INDEX IF EXISTS commitments_min_max_weight_per_compute_idx;
 DROP INDEX IF EXISTS commitments_delegation_utilization_idx;
 DROP INDEX IF EXISTS commitments_target_weight_per_compute_utilization_idx;
 DROP INDEX IF EXISTS commitments_combined_utilization_idx;

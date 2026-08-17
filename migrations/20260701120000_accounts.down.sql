@@ -1,0 +1,10 @@
+DROP INDEX IF EXISTS accounts_is_committer_idx;
+DROP INDEX IF EXISTS accounts_is_manager_idx;
+DROP INDEX IF EXISTS accounts_is_processor_idx;
+DROP INDEX IF EXISTS accounts_frozen_idx;
+DROP INDEX IF EXISTS accounts_reserved_idx;
+DROP INDEX IF EXISTS accounts_free_idx;
+DROP INDEX IF EXISTS accounts_total_external_idx;
+DROP INDEX IF EXISTS accounts_total_idx;
+DROP INDEX IF EXISTS accounts_transferable_idx;
+DROP TABLE IF EXISTS public.accounts;

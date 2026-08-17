@@ -4,7 +4,7 @@
 
 use crate::entities::{EpochIndexPhase, EpochRow};
 use crate::storage_indexing::{
-    is_block_within_pruning_threshold, process_storage_rules, StorageIndexingContext, TriggerKind,
+    process_storage_rules, rule_fully_pruned_at, StorageIndexingContext, TriggerKind,
 };
 use crate::utils::ensure_hex_prefix;
 use anyhow::anyhow;
@@ -150,8 +150,9 @@ pub async fn process_epoch_storage_indexing(
             let block_hash_copy = block_hash;
 
             tasks.spawn(async move {
-                // Decode the processor address (hex string without 0x prefix, always 64 chars)
-                let processor_bytes: [u8; 32] = match hex::decode(&processor_address) {
+                // Decode the processor address (hex string, may or may not have 0x prefix)
+                let hex_str = processor_address.strip_prefix("0x").unwrap_or(&processor_address);
+                let processor_bytes: [u8; 32] = match hex::decode(hex_str) {
                     Ok(bytes) => match bytes.try_into() {
                         Ok(b) => b,
                         Err(_) => {
@@ -283,26 +284,48 @@ pub async fn process_epoch_storage_indexing(
         .await;
 
         // Insert into managers table
+        let manager_address_str = manager_address.unwrap_or_default();
         let result = sqlx::query(
             r#"
             INSERT INTO managers (epoch, block_number, block_time, manager_id, manager_address, commitment_id, processors)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (epoch, manager_id) DO NOTHING
+            ON CONFLICT (epoch, manager_id) DO UPDATE SET
+                block_number = EXCLUDED.block_number,
+                block_time = EXCLUDED.block_time,
+                manager_address = EXCLUDED.manager_address,
+                commitment_id = EXCLUDED.commitment_id,
+                processors = EXCLUDED.processors
             "#,
         )
         .bind(epoch.epoch)
         .bind(snapshot_block_number)
         .bind(block_time)
         .bind(manager_id as i64)
-        .bind(manager_address.unwrap_or_default())
+        .bind(&manager_address_str)
         .bind(commitment_id.map(|c| c as i64))
         .bind(json!(metrics_map))
         .execute(db_pool)
         .await;
 
         match result {
-            Ok(_) => {
+            Ok(r) => {
+                crate::task_monitor::TASK_REGISTRY
+                    .record_db_insert(crate::task_monitor::DbEntity::Manager, r.rows_affected());
                 debug!("Inserted manager {} for epoch {}", manager_id, epoch.epoch);
+
+                if let Err(e) = super::flag_manager(
+                    db_pool,
+                    &manager_address_str,
+                    snapshot_block_number,
+                    block_time,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to flag manager account {}: {:?}",
+                        manager_address_str, e
+                    );
+                }
             }
             Err(e) => {
                 warn!(
@@ -352,29 +375,25 @@ pub async fn process_epoch_storage_rules_indexing(
         epoch.phase
     );
 
-    let all_epoch_rules =
-        crate::config::storage_rules().by_trigger_and_phase(TriggerKind::Epoch, phase_num);
-
-    // Filter rules based on pruning threshold (skip old epochs for rules with pruning)
-    let epoch_rules: Vec<_> = all_epoch_rules
+    // Skip rules whose every storage item is past its retention window.
+    let epoch_rules: Vec<_> = crate::config::storage_rules()
+        .by_trigger_and_phase(TriggerKind::Epoch, phase_num)
         .iter()
-        .filter(|rule| {
-            if let Some(finalized) = finalized_block {
-                let within_threshold = is_block_within_pruning_threshold(
-                    epoch.epoch_start as u32,
-                    finalized,
-                    &rule.pruning,
-                );
-                if !within_threshold {
+        .filter(|rule| match finalized_block {
+            Some(finalized) => {
+                let pruned =
+                    rule_fully_pruned_at(rule, epoch.epoch_start as u64, finalized as u64);
+                if pruned {
                     trace!(
-                        "Skipping epoch rule '{}' for epoch {} (block {}) - outside pruning threshold",
-                        rule.name, epoch.epoch, epoch.epoch_start
+                        "Skipping epoch rule '{}' for epoch {} (block {}) - all items past retention",
+                        rule.name,
+                        epoch.epoch,
+                        epoch.epoch_start
                     );
                 }
-                within_threshold
-            } else {
-                true // No finalized block info, process anyway
+                !pruned
             }
+            None => true,
         })
         .cloned()
         .collect();
@@ -428,8 +447,10 @@ pub async fn process_epoch_storage_rules_indexing(
 
             let ctx = StorageIndexingContext {
                 block_number: snapshot_block_number,
-                extrinsic_index: epoch.epoch as i32,
+                extrinsic_index: None,
                 event_index: None,
+                epoch_index: Some(epoch.epoch),
+                epoch_end: false,
                 data: None,
                 account_id: String::new(),
                 block_time: epoch.epoch_start_time,
@@ -475,8 +496,10 @@ pub async fn process_epoch_storage_rules_indexing(
 
                 let ctx = StorageIndexingContext {
                     block_number: snapshot_block_number,
-                    extrinsic_index: epoch.epoch as i32,
-                    event_index: Some(-1), // Use -1 to distinguish end snapshots from start
+                    extrinsic_index: None,
+                    event_index: None,
+                    epoch_index: Some(epoch.epoch),
+                    epoch_end: true,
                     data: None,
                     account_id: String::new(),
                     block_time: b.block_time,
@@ -520,12 +543,13 @@ pub async fn process_epoch_storage_rules_indexing(
     Ok(())
 }
 
-async fn update_epoch_phase(
+pub(super) async fn update_epoch_phase(
     db_pool: &Pool<Postgres>,
     epoch: i64,
     phase: EpochIndexPhase,
 ) -> Result<(), anyhow::Error> {
-    sqlx::query("UPDATE epochs SET phase = $1 WHERE epoch = $2;")
+    // Forward-only — see extrinsic_indexing.rs for the rationale.
+    sqlx::query("UPDATE epochs SET phase = $1 WHERE epoch = $2 AND phase < $1;")
         .bind(phase as i32)
         .bind(epoch)
         .execute(db_pool)
@@ -679,10 +703,11 @@ async fn get_all_processor_metrics_from_db(
         return std::collections::HashMap::new();
     }
 
-    // Normalize addresses: lowercase, no 0x prefix
+    // Normalize to match how ORIGIN-keyed storage_keys are stored (lowercase
+    // hex with 0x prefix, since 55b6746 "consistent storage key hex-prefixing").
     let normalized_addresses: Vec<String> = processor_addresses
         .iter()
-        .map(|a| a.to_lowercase().trim_start_matches("0x").to_string())
+        .map(|a| crate::utils::ensure_hex_prefix(&a.to_lowercase()))
         .collect();
 
     // Query last metric snapshot for each processor within the epoch block range

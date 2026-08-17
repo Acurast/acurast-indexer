@@ -130,24 +130,64 @@ export function Header() {
               </DropdownMenu>
 
               {/* Jobs */}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setCurrentMethod('jobs')}
-                className={currentMethod === 'jobs' ? 'bg-gray-700' : ''}
-              >
-                Jobs
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={methods[currentMethod].category === 'jobs' ? 'bg-gray-700' : ''}
+                  >
+                    Jobs <ChevronDown className="ml-1 h-3 w-3" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {getCategoryMethods('jobs').map(({ key, name }) => (
+                    <DropdownMenuItem key={key} onClick={() => setCurrentMethod(key)}>
+                      {name}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* Accounts */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={methods[currentMethod].category === 'accounts' ? 'bg-gray-700' : ''}
+                  >
+                    Accounts <ChevronDown className="ml-1 h-3 w-3" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {getCategoryMethods('accounts').map(({ key, name }) => (
+                    <DropdownMenuItem key={key} onClick={() => setCurrentMethod(key)}>
+                      {name}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               {/* Epochs */}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setCurrentMethod('epochs')}
-                className={currentMethod === 'epochs' ? 'bg-gray-700' : ''}
-              >
-                Epochs
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={methods[currentMethod].category === 'epochs' ? 'bg-gray-700' : ''}
+                  >
+                    Epochs <ChevronDown className="ml-1 h-3 w-3" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {getCategoryMethods('epochs').map(({ key, name }) => (
+                    <DropdownMenuItem key={key} onClick={() => setCurrentMethod(key)}>
+                      {name}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               {/* Managers */}
               <DropdownMenu>

@@ -9,6 +9,8 @@ import { BatchSheet } from '@/components/batch/BatchSheet'
 import { MetricsGraph } from '@/components/metrics/MetricsGraph'
 import { ProcessorsCountGraph } from '@/components/metrics/ProcessorsCountGraph'
 import { StorageSnapshotsGraph } from '@/components/metrics/StorageSnapshotsGraph'
+import { DeploymentsGraph } from '@/components/metrics/DeploymentsGraph'
+import { EpochTotalsGraph } from '@/components/metrics/EpochTotalsGraph'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useBatchStore, useFormStore } from '@/stores/formStore'
 import { useApiKey } from '@/hooks/useApiKey'
@@ -42,6 +44,12 @@ function Dashboard() {
   const showMetricsGraph = currentMethod === 'epochMetrics' && result?.items && (result.items as unknown[]).length > 0
   const showProcessorsCountGraph = currentMethod === 'processorsCountByEpoch' && result?.items && (result.items as unknown[]).length > 0
   const showStorageSnapshotsGraph = currentMethod === 'storageSnapshots' && result?.items && (result.items as unknown[]).length > 0
+  const showDeploymentsGraph = currentMethod === 'deployments' && result?.items && (result.items as unknown[]).length > 0
+  // getEpochTotals returns a bare array (Vec), not a Page with `.items`.
+  const epochTotalsItems = Array.isArray(lastResponse?.result)
+    ? (lastResponse!.result as { epoch: number; block_number: number; block_time: string; total_vesting: string; total_token_claim: string; total_self_staked: string; total_delegated: string }[])
+    : []
+  const showEpochTotalsGraph = currentMethod === 'epochTotals' && epochTotalsItems.length > 0
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
@@ -89,6 +97,30 @@ function Dashboard() {
           </CardHeader>
           <CardContent className="p-4">
             <StorageSnapshotsGraph data={result.items as { id: number; block_number: number; block_time: string; pallet: number; storage_location: string; storage_keys: unknown; data: unknown; config_rule: string }[]} />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Deployments Graph - spans both columns */}
+      {showDeploymentsGraph && (
+        <Card className="bg-gray-800 border-gray-700 lg:col-span-2">
+          <CardHeader className="py-2 px-4 border-b border-gray-700">
+            <CardTitle className="text-sm font-medium text-gray-400">Deployments Graph</CardTitle>
+          </CardHeader>
+          <CardContent className="p-4">
+            <DeploymentsGraph data={result.items as { address: string; seq_id: number; created_block_time: string; reward: string; is_active: boolean }[]} />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Epoch Totals Graph - spans both columns */}
+      {showEpochTotalsGraph && (
+        <Card className="bg-gray-800 border-gray-700 lg:col-span-2">
+          <CardHeader className="py-2 px-4 border-b border-gray-700">
+            <CardTitle className="text-sm font-medium text-gray-400">Epoch Totals Graph</CardTitle>
+          </CardHeader>
+          <CardContent className="p-4">
+            <EpochTotalsGraph data={epochTotalsItems} />
           </CardContent>
         </Card>
       )}

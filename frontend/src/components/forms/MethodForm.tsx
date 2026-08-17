@@ -13,14 +13,15 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import { PalletSelector, MethodSelector, ComboboxSelector, StoragePalletSelector, StorageLocationSelector, ConfigRuleSelector } from './PalletMethodSelector'
+import { PalletSelector, MethodSelector, ComboboxSelector, StoragePalletSelector, StorageLocationSelector, ConfigRuleSelector, PalletPairsSelector, AddressListSelector } from './PalletMethodSelector'
 import { DateTimePicker } from './DatePicker'
 import { useFormStore, useBatchStore } from '@/stores/formStore'
 import { useUIStore } from '@/stores/uiStore'
 import { useApiKey } from '@/hooks/useApiKey'
 import { useRpcRequest } from '@/hooks/useRpcRequest'
 import { methods } from '@/config/methods'
-import type { FieldConfig, RpcRequest } from '@/lib/types'
+import { buildRpcRequest } from '@/lib/buildRpcRequest'
+import type { FieldConfig, PalletPair, RpcRequest } from '@/lib/types'
 
 export function MethodForm() {
   const {
@@ -44,78 +45,55 @@ export function MethodForm() {
     // Get latest formValues from store to avoid closure issues
     const latestFormValues = useFormStore.getState().formValues
     const latestCursor = useFormStore.getState().currentCursor
-    const params: Record<string, unknown> = {}
-    let simpleParam: string | null = null
-
-    methodConfig.fields.forEach(field => {
-      if (field.type === 'separator') return
-
-      const value = latestFormValues[field.name]
-      if (value === undefined || value === '' || value === null) return
-
-      // Skip false checkboxes (only include when true)
-      if (field.type === 'checkbox' && !value) return
-
-      let processedValue: unknown = value
-
-      if (field.type === 'number') {
-        processedValue = parseInt(value as string)
-      } else if (field.type === 'json') {
-        try {
-          processedValue = JSON.parse(value as string)
-        } catch {
-          processedValue = value
-        }
-      } else if (field.type === 'datetime') {
-        processedValue = new Date(value as string).toISOString()
-      } else if (field.type === 'checkbox') {
-        processedValue = !!value
-      } else if (field.type === 'booleanSelect') {
-        // Convert string "true"/"false" to actual boolean
-        if (value === 'true') processedValue = true
-        else if (value === 'false') processedValue = false
-        else return // Skip empty values
-      }
-
-      if (field.isParam) {
-        simpleParam = processedValue as string
-      } else if (field.nested) {
-        if (!params[field.nested]) {
-          params[field.nested] = {}
-        }
-        const propName = field.name.split('.').pop()!
-        ;(params[field.nested] as Record<string, unknown>)[propName] = processedValue
-      } else {
-        params[field.name] = processedValue
-      }
+    return buildRpcRequest(methodConfig, latestFormValues, {
+      id,
+      cursor: latestCursor,
     })
-
-    // Clean up empty nested objects
-    Object.keys(params).forEach(key => {
-      if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
-        if (Object.keys(params[key] as object).length === 0) {
-          delete params[key]
-        }
-      }
-    })
-
-    // Add cursor if paginating (pass through as-is, server handles typing)
-    if (latestCursor !== null && latestCursor !== undefined) {
-      params.cursor = latestCursor
-    }
-
-    return {
-      jsonrpc: '2.0',
-      method: methodConfig.name,
-      params: simpleParam !== null ? simpleParam : params,
-      id
-    }
   }, [methodConfig, currentMethod])
+
+  // Validate data filter requirements
+  const validateDataFilter = (): string | null => {
+    const data = formValues['data']
+    if (data === undefined || data === '' || data === null) return null
+
+    if (currentMethod === 'extrinsics' || methodConfig.name === 'getExtrinsics') {
+      const pallet = formValues['pallet']
+      const method = formValues['method']
+      if (!pallet || !method) {
+        return 'Data filter requires both Pallet and Method to be specified'
+      }
+    }
+
+    if (currentMethod === 'events' || methodConfig.name === 'getEvents') {
+      const pallet = formValues['pallet']
+      const variant = formValues['variant']
+      if (!pallet || !variant) {
+        return 'Data filter requires both Pallet and Event Variant to be specified'
+      }
+    }
+
+    if (currentMethod === 'storageSnapshots' || methodConfig.name === 'getStorageSnapshots') {
+      const pallet = formValues['pallet']
+      const storageLocation = formValues['storage_location']
+      if (!pallet || !storageLocation) {
+        return 'Data filter requires both Storage Pallet and Storage Location to be specified'
+      }
+    }
+
+    return null
+  }
 
   // Execute request
   const handleExecute = async () => {
     if (!apiKey) {
       toast.error('Please enter an API key')
+      return
+    }
+
+    // Validate data filter requirements
+    const validationError = validateDataFilter()
+    if (validationError) {
+      toast.error(validationError)
       return
     }
 
@@ -138,6 +116,13 @@ export function MethodForm() {
 
   // Add to batch
   const handleAddToBatch = () => {
+    // Validate data filter requirements
+    const validationError = validateDataFilter()
+    if (validationError) {
+      toast.error(validationError)
+      return
+    }
+
     const request = buildRequest(Date.now())
 
     const summary = summarizeRequest(request)
@@ -258,6 +243,16 @@ export function MethodForm() {
           />
         )}
 
+        {field.type === 'date' && (
+          <Input
+            type="date"
+            value={value as string}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={field.placeholder}
+            className={commonInputClasses}
+          />
+        )}
+
         {field.type === 'json' && (
           <Textarea
             value={value as string}
@@ -329,6 +324,22 @@ export function MethodForm() {
         {field.type === 'configRuleCombobox' && (
           <ConfigRuleSelector
             value={value as string}
+            onChange={onChange}
+            placeholder={field.placeholder}
+          />
+        )}
+
+        {field.type === 'palletMethodPairs' && (
+          <PalletPairsSelector
+            value={value as PalletPair[] | undefined}
+            onChange={onChange}
+            metaType={field.metaType || 'extrinsics'}
+          />
+        )}
+
+        {field.type === 'addressList' && (
+          <AddressListSelector
+            value={value as string[] | undefined}
             onChange={onChange}
             placeholder={field.placeholder}
           />

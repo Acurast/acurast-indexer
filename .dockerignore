@@ -1,11 +1,43 @@
-web
+# Build outputs
 target
+frontend/node_modules
+frontend/dist
+frontend/dist-ssr
+**/node_modules
+
+# Docker / compose (not needed in build context)
 Dockerfile
-docker-compose.yml
-configuration/local.yml
-docker_config
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+
+# Secrets & local-only config
 .env
+.env.*
+!.env.example
+configuration/local.yaml
+
+# VCS & CI
 .git
 .gitignore
-.dockerignore
+.gitlab-ci.yml
+.github
+.claude
+
+# Deploy manifests & scripts not used by the image build
+k8s
+scripts
+
+# Docs & assets
 README.md
+architecture.md
+LICENSE
+*.png
+
+# One-off SQL / data dumps not needed to build the binary
+sql
+dedup_storage_snapshots*.sql
+
+# Editor / OS cruft
+.DS_Store
+*.log

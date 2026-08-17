@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::entities::{Block, EpochIndexPhase, EpochRow, EventsIndexPhase};
@@ -37,12 +38,10 @@ struct Cycle {
 
 /// Index the current epoch at the given block.
 /// Inserts into the epochs table, ignoring if the epoch already exists.
-/// If we're at an epoch_start block and `epoch_tx` is provided, sends (epoch, block_hash) on the channel.
 pub async fn index_epoch_at_block(
     block_data: &Block,
     db_pool: &Pool<Postgres>,
     client: &OnlineClient<PolkadotConfig>,
-    epoch_tx: Option<&tokio::sync::mpsc::Sender<(u32, String)>>,
 ) -> Result<(), anyhow::Error> {
     let stored_cycle = if (block_data.block_number as u32)
         < LOWEST_BLOCK_WITH_CURRENT_CYCLE.load(Ordering::Relaxed)
@@ -53,6 +52,7 @@ pub async fn index_epoch_at_block(
         let block_hash = H256::from_slice(&hash_bytes);
 
         // Get block for storage queries
+        crate::utils::record_node_rpc_call();
         let block = client.blocks().at(block_hash).await?;
 
         // Fetch CurrentCycle from pallet 48
@@ -62,6 +62,7 @@ pub async fn index_epoch_at_block(
             Vec::<subxt::dynamic::Value>::new(),
         );
 
+        crate::utils::record_node_rpc_call();
         match block.storage().fetch(&storage_query).await {
             Ok(Some(value)) => {
                 // Decode the raw bytes into our Cycle struct
@@ -109,26 +110,8 @@ pub async fn index_epoch_at_block(
     .execute(db_pool)
     .await?;
 
-    // If we're at the epoch_start block, notify via channel with the block hash
-    let is_epoch_start_block = block_data.block_number == cycle.epoch_start as i64;
-    if is_epoch_start_block {
-        if let Some(tx) = epoch_tx {
-            // Send notification on channel (non-blocking)
-            if let Err(e) = tx.try_send((cycle.epoch, block_data.hash.clone())) {
-                debug!(
-                    "Failed to send epoch notification for epoch {} at block {}: {:?}",
-                    cycle.epoch, block_data.block_number, e
-                );
-            } else {
-                trace!(
-                    "Sent epoch {} notification at epoch_start block {}",
-                    cycle.epoch,
-                    cycle.epoch_start
-                );
-            }
-        }
-    }
-
+    crate::task_monitor::TASK_REGISTRY
+        .record_db_insert(crate::task_monitor::DbEntity::Epoch, result.rows_affected());
     if result.rows_affected() > 0 {
         trace!(
             "New epoch {} inserted (epoch_start block: {})",
@@ -146,16 +129,20 @@ pub async fn index_epoch_at_block(
 /// and queues them for phase workers. This handles the case where the indexer was
 /// restarted mid-processing.
 ///
-/// Queries for all epochs where: phase >= 1 (EventsReady) AND phase < max_phase_for(Epoch)
+/// Queries for all epochs where: phase >= 1 (EventsReady) AND phase < EpochIndexPhase::MAX
 pub async fn queue_epochs_phase(
     tx: Sender<EpochRow>,
     db_pool: Pool<Postgres>,
     cancel_token: CancellationToken,
     index_from_block: u32,
+    epoch_totals_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), anyhow::Error> {
-    use crate::storage_indexing::TriggerKind;
-
-    let max_epoch_phase = crate::config::storage_rules().max_phase_for(TriggerKind::Epoch);
+    // The epoch pipeline's final phase is defined by the enum, not the rule set.
+    // The accounts materializer (StorageIndexed3 -> AccountsMaterialized) is a
+    // code-driven phase that runs after the last epoch storage rule, so it does
+    // not raise `max_phase_for`. Bound requeuing by the enum MAX so epochs are
+    // driven all the way to AccountsMaterialized (matching the health check).
+    let max_epoch_phase = EpochIndexPhase::MAX;
     let task_id = TASK_REGISTRY.start(
         format!("Queue epochs (phases 1-{})", max_epoch_phase - 1),
         None,
@@ -187,11 +174,12 @@ pub async fn queue_epochs_phase(
             )
             SELECT epoch, epoch_start, epoch_start_time, phase, epoch_end
             FROM ranked
-            WHERE phase >= 1 AND phase < $1 AND epoch_start >= $2 AND epoch_end IS NOT NULL
+            WHERE phase >= 1 AND phase < $1 AND epoch_start >= $2 AND epoch >= $3 AND epoch_end IS NOT NULL
             ORDER BY epoch ASC"#,
         )
         .bind(max_epoch_phase as i32)
         .bind(index_from_block as i64)
+        .bind(crate::config::settings().indexer.index_from_epoch)
         .fetch_all(&db_pool)
         .await
         .map_err(|e| AppError::InternalError(e.into()))?;
@@ -209,7 +197,17 @@ pub async fn queue_epochs_phase(
             );
         }
 
-        for epoch in epochs {
+        // The `AccountsMaterialized -> EpochTotalsComputed` step
+        // (`process_epoch_totals`) rewrites the shared per-account vesting
+        // cohort in `accounts`, so at most ONE epoch may run it at a time and
+        // only the LATEST epoch's result reflects current network/account
+        // state. Split those off; phases 1-3 are concurrency-safe and queued
+        // normally.
+        let (totals_pending, others): (Vec<EpochRow>, Vec<EpochRow>) = epochs
+            .into_iter()
+            .partition(|e| e.phase == EpochIndexPhase::AccountsMaterialized);
+
+        for epoch in others {
             if cancel_token.is_cancelled() {
                 break;
             }
@@ -232,6 +230,57 @@ pub async fn queue_epochs_phase(
                     result?;
                     queued.insert(key);
                     info!("Queued epoch {} (phase {}) for processing", epoch.epoch, epoch.phase as i32);
+                }
+            }
+        }
+
+        // Totals phase: compute totals only for the latest epoch and
+        // fast-forward any older backlog straight to `EpochTotalsComputed`
+        // without a totals row — their per-account contribution is superseded
+        // by the latest (guarded by `accounts.vesting_epoch`) and only the
+        // latest network totals matter. In steady state exactly one epoch is
+        // here, so nothing is skipped; a backlog only forms after downtime.
+        if !cancel_token.is_cancelled() {
+            if let Some(latest) = totals_pending.iter().max_by_key(|e| e.epoch).cloned() {
+                let skip_ids: Vec<i64> = totals_pending
+                    .iter()
+                    .map(|e| e.epoch)
+                    .filter(|&ep| ep != latest.epoch)
+                    .collect();
+                if !skip_ids.is_empty() {
+                    sqlx::query("UPDATE epochs SET phase = $1 WHERE epoch = ANY($2)")
+                        .bind(EpochIndexPhase::EpochTotalsComputed as i32)
+                        .bind(&skip_ids)
+                        .execute(&db_pool)
+                        .await
+                        .map_err(|e| AppError::InternalError(e.into()))?;
+                    info!(
+                        "Fast-forwarded {} backlog epoch(s) past totals; only latest epoch {} computes totals",
+                        skip_ids.len(),
+                        latest.epoch
+                    );
+                }
+
+                // Queue the latest for totals only when no run is currently in
+                // flight (the worker holds `epoch_totals_lock` for the whole
+                // run). Intentionally NOT tracked in `queued`: the lock stops a
+                // concurrent second run, the writes are idempotent, and
+                // skipping the dedupe lets a failed run retry on the next scan.
+                if epoch_totals_lock.try_lock().is_ok() {
+                    TASK_REGISTRY.set_epoch(task_id, latest.epoch);
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {},
+                        result = tx.send(latest.clone()) => {
+                            result?;
+                            info!("Queued latest epoch {} for totals computation", latest.epoch);
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Epoch-totals run in progress; deferring latest epoch {}",
+                        latest.epoch
+                    );
                 }
             }
         }
@@ -265,7 +314,8 @@ pub async fn wait_epoch_events_ready(
 
         // Step 1: Find the HIGHEST epoch with phase 0 (Raw), using LEAD() to get next epoch's start
         // Process newest epoch first; events should be prioritized by recency to match
-        // excluding epochs that can never be completed because their start block lies before index_from_block
+        // Excludes epochs that can never be completed because their start block lies
+        // before index_from_block, and epochs below the configured index_from_epoch floor.
         let epoch: Option<EpochRow> = sqlx::query_as(
             r#"WITH ranked AS (
                 SELECT epoch, epoch_start, epoch_start_time, phase,
@@ -274,12 +324,13 @@ pub async fn wait_epoch_events_ready(
             )
             SELECT epoch, epoch_start, epoch_start_time, phase, epoch_end
             FROM ranked
-            WHERE phase = $1 AND epoch_end IS NOT NULL AND epoch_start >= $2
+            WHERE phase = $1 AND epoch_end IS NOT NULL AND epoch_start >= $2 AND epoch >= $3
             ORDER BY epoch DESC
             LIMIT 1"#,
         )
         .bind(EpochIndexPhase::Raw as i32)
         .bind(index_from_block as i64)
+        .bind(crate::config::settings().indexer.index_from_epoch)
         .fetch_optional(&db_pool)
         .await
         .map_err(|e| AppError::InternalError(e.into()))?;
@@ -381,8 +432,10 @@ pub async fn wait_epoch_events_ready(
             info!("{}", msg);
             TASK_REGISTRY.set_detail(task_id, msg);
 
-            // Step 3: Update the epoch phase to EventsReady
-            sqlx::query("UPDATE epochs SET phase = $1 WHERE epoch = $2")
+            // Forward-only phase advance — see extrinsic_indexing.rs for the
+            // rationale (re-processed blocks must not regress already-advanced
+            // epochs).
+            sqlx::query("UPDATE epochs SET phase = $1 WHERE epoch = $2 AND phase < $1")
                 .bind(EpochIndexPhase::EventsReady as i32)
                 .bind(epoch.epoch)
                 .execute(&db_pool)

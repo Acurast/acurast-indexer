@@ -150,7 +150,7 @@ cargo install bunyan
 ./target/release/acurast-indexer run | bunyan
 ```
 
-The API will be available at `http://localhost:8000/api/v1/rpc`.
+The API will be available at `http://localhost:8001/api/v1/rpc`.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -159,7 +159,7 @@ The API will be available at `http://localhost:8000/api/v1/rpc`.
 
 For production deployments, use the provided Docker Compose file:
 
-1. Create your production configuration similar to [the example](configuration/production.yaml) at `./configuration/production.yaml` relative to your production `docker-compose.yaml` file.
+1. Create your production configuration at `configuration/production.yaml`
 2. Configure your `.env` file with the required environment variables
 3. Start the services:
    ```sh
@@ -208,12 +208,14 @@ All API calls use the JSON-RPC 2.0 format. Live API documentation is available a
 | `getEvent` | Get a single event by extrinsic ID and index |
 | `getEvents` | Get events with filters (pallet, variant, account) |
 | `getJobs` | Get job/deployment appearances in events |
+| `getAccounts` | Get accounts ranked by balance with filters (processor/manager/committer, processor/device type, account, exclude list) |
+| `getAccountsCount` | Count accounts matching the same filters as `getAccounts` |
 
 ### Example: Get Extrinsics
 
 ```sh
 curl -X POST -H "Content-Type: application/json" \
-  http://localhost:8000/api/v1/rpc \
+  http://localhost:8001/api/v1/rpc \
   -d '{
     "jsonrpc": "2.0",
     "method": "getExtrinsics",
@@ -226,7 +228,7 @@ curl -X POST -H "Content-Type: application/json" \
 
 ```sh
 curl -X POST -H "Content-Type: application/json" \
-  http://localhost:8000/api/v1/rpc \
+  http://localhost:8001/api/v1/rpc \
   -d '[
     {"jsonrpc": "2.0", "method": "getExtrinsics", "params": {"limit": 10}, "id": 1},
     {"jsonrpc": "2.0", "method": "getBlocksCount", "params": {}, "id": 2}

@@ -6,6 +6,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useFormStore } from '@/stores/formStore'
 import { useApiKey } from '@/hooks/useApiKey'
 import { methods } from '@/config/methods'
+import { buildRpcRequest } from '@/lib/buildRpcRequest'
+import { shellQuote } from '@/lib/shellQuote'
 import type { RpcRequest } from '@/lib/types'
 
 export function CurlPreview() {
@@ -16,67 +18,17 @@ export function CurlPreview() {
   const methodConfig = methods[currentMethod]
 
   const request = useMemo((): RpcRequest => {
-    const params: Record<string, unknown> = {}
-    let simpleParam: string | null = null
-
-    methodConfig.fields.forEach(field => {
-      if (field.type === 'separator') return
-
-      const value = formValues[field.name]
-      if (value === undefined || value === '' || value === null) return
-
-      let processedValue: unknown = value
-
-      if (field.type === 'number') {
-        processedValue = parseInt(value as string)
-      } else if (field.type === 'json') {
-        try {
-          processedValue = JSON.parse(value as string)
-        } catch {
-          processedValue = value
-        }
-      } else if (field.type === 'datetime') {
-        processedValue = new Date(value as string).toISOString()
-      }
-
-      if (field.isParam) {
-        simpleParam = processedValue as string
-      } else if (field.nested) {
-        if (!params[field.nested]) {
-          params[field.nested] = {}
-        }
-        const propName = field.name.split('.').pop()!
-        ;(params[field.nested] as Record<string, unknown>)[propName] = processedValue
-      } else {
-        params[field.name] = processedValue
-      }
-    })
-
-    // Clean up empty nested objects
-    Object.keys(params).forEach(key => {
-      if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
-        if (Object.keys(params[key] as object).length === 0) {
-          delete params[key]
-        }
-      }
-    })
-
-    return {
-      jsonrpc: '2.0',
-      method: methodConfig.name,
-      params: simpleParam !== null ? simpleParam : params,
-      id: 1
-    }
+    return buildRpcRequest(methodConfig, formValues)
   }, [methodConfig, formValues, currentMethod])
 
   const curlCommand = useMemo(() => {
     const key = apiKey || 'YOUR_API_KEY'
     const jsonStr = JSON.stringify(request)
 
-    return `curl -X POST '${window.location.origin}/api/v1/rpc' \\
-  -H 'Content-Type: application/json' \\
-  -H 'API-Key: ${key}' \\
-  -d '${jsonStr}'`
+    return `curl -X POST ${shellQuote(`${window.location.origin}/api/v1/rpc`)} \\
+  -H ${shellQuote('Content-Type: application/json')} \\
+  -H ${shellQuote(`API-Key: ${key}`)} \\
+  -d ${shellQuote(jsonStr)}`
   }, [request, apiKey])
 
   const handleCopy = async () => {

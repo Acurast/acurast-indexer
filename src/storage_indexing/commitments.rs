@@ -39,8 +39,6 @@ const UNIQUES_ASSET_STORAGE: &str = "Asset";
 
 /// Hard-coded pallet name for AcurastCompute
 const ACURAST_COMPUTE_PALLET: &str = "AcurastCompute";
-/// Hard-coded storage location for Backings
-const BACKINGS_STORAGE: &str = "Backings";
 /// Hard-coded storage location for CurrentCycle (epoch info)
 const CURRENT_CYCLE_STORAGE: &str = "CurrentCycle";
 
@@ -244,23 +242,17 @@ async fn process_commitment_snapshots_with_block(
         };
 
         // Get epoch for this snapshot's block
-        let epoch: Option<(i64,)> = sqlx::query_as(
-            "SELECT epoch FROM epochs WHERE epoch_start <= $1 ORDER BY epoch DESC LIMIT 1",
-        )
-        .bind(snapshot.block_number)
-        .fetch_optional(db_pool)
-        .await?;
-
-        let epoch = match epoch {
-            Some((e,)) => e,
-            None => {
-                warn!(
-                    "Could not find epoch for snapshot {} at block {}, skipping",
-                    snapshot.id, snapshot.block_number
-                );
-                continue;
-            }
-        };
+        let epoch =
+            match crate::storage_indexing::epoch_for_block(db_pool, snapshot.block_number).await? {
+                Some(e) => e,
+                None => {
+                    warn!(
+                        "Could not find epoch for snapshot {} at block {}, skipping",
+                        snapshot.id, snapshot.block_number
+                    );
+                    continue;
+                }
+            };
 
         // Process the commitment using shared logic
         match process_single_commitment(
@@ -488,7 +480,7 @@ async fn process_single_commitment(
     let last_slashing_epoch = extract_i64_field(data, &["last_slashing_epoch"]);
     let stake_created_epoch = extract_i64_field(data, &["stake", "created"]);
     let cooldown_started = extract_optional_i64_field(data, &["stake", "cooldown_started"]);
-    let stake_cooldown = extract_optional_i64_field(data, &["stake", "cooldown_period"]);
+    let stake_cooldown = extract_i64_field(data, &["stake", "cooldown_period"]);
 
     // Check if stake is active (not null/ended)
     let is_active = data.get("stake").map(|s| !s.is_null()).unwrap_or(false);
@@ -528,7 +520,7 @@ async fn process_single_commitment(
         .collect();
 
     // Upsert into commitments table (snapshot_id = 0 for chain-scanned commitments)
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO commitments (
             commitment_id, snapshot_id, block_number, block_time, epoch,
@@ -618,6 +610,10 @@ async fn process_single_commitment(
     .bind(&committed_metrics_json)
     .execute(db_pool)
     .await?;
+    crate::task_monitor::TASK_REGISTRY.record_db_insert(
+        crate::task_monitor::DbEntity::Commitment,
+        result.rows_affected(),
+    );
 
     trace!(
         "Upserted commitment {} (committer: {}, manager: {:?})",
@@ -625,6 +621,20 @@ async fn process_single_commitment(
         committer_address,
         manager_id
     );
+
+    if let Err(e) =
+        super::flag_committer(db_pool, &committer_address, block_number, block_time).await
+    {
+        warn!(
+            "Failed to flag committer account {}: {:?}",
+            committer_address, e
+        );
+    }
+    if let Some(addr) = manager_address.as_deref().filter(|s| !s.is_empty()) {
+        if let Err(e) = super::flag_manager(db_pool, addr, block_number, block_time).await {
+            warn!("Failed to flag manager account {}: {:?}", addr, e);
+        }
+    }
 
     Ok(true)
 }
@@ -777,52 +787,6 @@ async fn get_first_owned_asset(
         }
     }
 }
-
-/// Get backing manager_id for a commitment using dynamic query
-/// Backings is StorageDoubleMap<CommitmentId, ManagerId, ()>
-/// We query with commitment_id as partial key and take the first manager_id found
-async fn get_backing_manager_id(
-    block: &subxt::blocks::Block<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-    commitment_id: u128,
-) -> Result<Option<u128>, anyhow::Error> {
-    let storage_query = subxt::dynamic::storage(
-        ACURAST_COMPUTE_PALLET,
-        BACKINGS_STORAGE,
-        vec![subxt::dynamic::Value::u128(commitment_id)],
-    );
-
-    let mut iter = block.storage().iter(storage_query).await?;
-
-    // Take the first entry - keys[1] is the manager_id
-    match iter.next().await {
-        Some(Ok(kv)) => {
-            if kv.keys.len() == 1 {
-                kv.keys[0]
-                    .as_u128()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Failed to parse manager_id as u128 for commitment {}",
-                            commitment_id
-                        )
-                    })
-                    .map(Some)
-            } else {
-                Err(anyhow!(
-                    "Backings entry for commitment {}  keys (expected 1, got {})",
-                    commitment_id,
-                    kv.keys.len()
-                ))
-            }
-        }
-        Some(Err(e)) => Err(anyhow!(
-            "Failed to read Backings entry for commitment {}: {:?}",
-            commitment_id,
-            e
-        )),
-        None => Ok(None), // No backing exists for this commitment
-    }
-}
-
 /// Extract a numeric field from nested JSON path as BigDecimal
 /// Path elements can be object keys or array indices (numeric strings like "0")
 fn extract_numeric_field(data: &JsonValue, path: &[&str]) -> BigDecimal {

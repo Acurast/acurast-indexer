@@ -14,6 +14,7 @@ pub mod extrinsic_indexing;
 pub mod health_state;
 pub mod metadata;
 pub mod phase_work;
+pub mod processor_churn;
 mod response;
 pub mod routes;
 pub mod rpc_server;

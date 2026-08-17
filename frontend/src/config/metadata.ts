@@ -82,7 +82,7 @@ export const eventsMetadata: PalletMetadata = {
 export const storageMetadata: PalletMetadata = {
   "Balances": ["TotalIssuance", "InactiveIssuance"],
   "System": ["Account"],
-  "Acurast": ["StoredJobRegistration"],
+  "Acurast": ["StoredAttestation", "StoredJobRegistration"],
   "AcurastCompute": ["Commitments", "ComputeCommitments", "Delegations", "Metrics", "MetricsEpochSum", "StakeBasedRewards"],
   "AcurastTokenClaim": ["Claimed", "Vesting"]
 }
@@ -112,5 +112,8 @@ export const configRules = [
   'total_issuance',
   'token_claimed',
   'token_claimed_v2',
-  'token_vested'
+  'token_vested',
+  'known_accounts',
+  'attestation_stored',
+  'attestation_stored_v2'
 ]

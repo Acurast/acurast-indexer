@@ -28,9 +28,15 @@ export interface BatchRequest {
   summary: string
 }
 
+export interface PalletPair {
+  pallet?: string
+  method?: string
+  variant?: string
+}
+
 export interface FieldConfig {
   name: string
-  type: 'text' | 'number' | 'select' | 'booleanSelect' | 'datetime' | 'json' | 'combobox' | 'palletCombobox' | 'methodCombobox' | 'storagePalletCombobox' | 'storageLocationCombobox' | 'configRuleCombobox' | 'separator' | 'checkbox'
+  type: 'text' | 'number' | 'select' | 'booleanSelect' | 'datetime' | 'date' | 'json' | 'combobox' | 'palletCombobox' | 'methodCombobox' | 'storagePalletCombobox' | 'storageLocationCombobox' | 'configRuleCombobox' | 'separator' | 'checkbox' | 'palletMethodPairs' | 'addressList'
   label: string
   placeholder?: string
   required?: boolean
@@ -44,7 +50,7 @@ export interface FieldConfig {
 
 export interface MethodConfig {
   name: string
-  category: 'blocks' | 'extrinsics' | 'events' | 'storage' | 'jobs' | 'epochs' | 'managers' | 'staking'
+  category: 'blocks' | 'extrinsics' | 'events' | 'storage' | 'jobs' | 'epochs' | 'managers' | 'staking' | 'accounts'
   fields: FieldConfig[]
 }
 
@@ -54,6 +60,6 @@ export interface Example {
   description: string
 }
 
-export type MethodCategory = 'blocks' | 'extrinsics' | 'events' | 'storage' | 'jobs' | 'epochs' | 'managers' | 'staking'
+export type MethodCategory = 'blocks' | 'extrinsics' | 'events' | 'storage' | 'jobs' | 'epochs' | 'managers' | 'staking' | 'accounts'
 
 export type PalletMetadata = Record<string, string[]>

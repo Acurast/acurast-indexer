@@ -27,6 +27,7 @@ pub struct HealthResponse {
     pub live: bool,
     pub ready: bool,
     pub synced: bool,
+    pub synced_backwards: bool,
     pub latest_indexed_block: BlockInfo,
     pub current_block: Option<u32>,
     pub finalized_block: Option<u32>,
@@ -118,24 +119,24 @@ pub async fn health(
         false
     };
 
-    // Calculate synced flag:
-    // - min for final phase (EpochIndexPhase::MAX) is equal or below index_from_epoch config
-    // - final phase max is no more than 1 behind phase0.max
-    // - latest_indexed_block is not older than 3 minutes
+    // synced: final phase max is no more than 1 behind phase0.max AND
+    //         latest_indexed_block is not older than 3 minutes.
+    // synced_backwards: final phase min has reached index_from_epoch config
+    //                   (reported plain, not gating `synced`).
     let index_from_epoch = crate::config::settings().indexer.index_from_epoch;
     let phase0 = epochs.get("0");
     let final_phase = epochs.get(&EpochIndexPhase::MAX.to_string());
 
-    let synced = if let (Some(p0), Some(pmax)) = (phase0, final_phase) {
-        let sufficiently_back_indexed = pmax.min <= Some(index_from_epoch);
+    let (synced, synced_backwards) = if let (Some(p0), Some(pmax)) = (phase0, final_phase) {
+        let synced_backwards = pmax.min <= Some(index_from_epoch);
         let final_phase_caught_up = match (p0.max, pmax.max) {
-            (Some(p0_max), Some(pmax_max)) => p0_max - pmax_max <= 1,
+            (Some(p0_max), Some(pmax_max)) => p0_max - pmax_max <= 2,
             _ => false,
         };
 
-        sufficiently_back_indexed && final_phase_caught_up && block_time_fresh
+        (final_phase_caught_up && block_time_fresh, synced_backwards)
     } else {
-        false
+        (false, false)
     };
 
     // Get current block from RPC (best effort, don't fail health check)
@@ -201,6 +202,7 @@ pub async fn health(
         live,
         ready,
         synced,
+        synced_backwards,
         latest_indexed_block,
         current_block,
         finalized_block,

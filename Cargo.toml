@@ -10,6 +10,7 @@ anyhow = { version = "1.0.97", features = ["backtrace"]}
 axum = { version = "0.8.1", features = ["multipart", "tokio", "http2"] }
 axum-macros = "0.5.0"
 base64 = "0.22.1"
+bs58 = "0.5"
 chrono = { version = "0.4.40", default-features = false, features = ["serde"] }
 clap = { version = "4.5.31", features = ["derive", "env"] }
 config = "0.15.9"
@@ -51,3 +52,11 @@ moka = { version = "0.12", features = ["future"] }
 [dev-dependencies]
 sqlx-cli = "0.8.3"
 reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "debug_assigned_processors"
+path = "src/bin/debug_assigned_processors.rs"
+
+[[bin]]
+name = "debug_job_registration"
+path = "src/bin/debug_job_registration.rs"

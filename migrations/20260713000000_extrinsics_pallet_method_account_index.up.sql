@@ -1,0 +1,21 @@
+-- no-transaction
+-- Index for the processor-churn RPC (getProcessorChurn).
+--
+-- Active-processor counts are `count(DISTINCT account_id)` over the
+-- heartbeat_with_version extrinsics in a block-number window. The existing
+-- extrinsics_pallet_method_idx (pallet, method, block_number) does not carry
+-- account_id, so that count heap-fetches account_id for every matching row —
+-- hundreds of millions of heartbeats over a 12-month window — and times out.
+--
+-- Leading (pallet, method, account_id) lets the RPC enumerate the distinct
+-- processors with a recursive loose index scan (one descent per processor
+-- instead of scanning every heartbeat), and the trailing block_number turns the
+-- per-processor "did it heartbeat in [lo, hi]?" probe into a direct index seek.
+-- Cost then scales with the processor count (thousands), not the heartbeat
+-- count (hundreds of millions).
+--
+-- CONCURRENTLY so the indexer's INSERT INTO extrinsics keeps running during the
+-- build; -- no-transaction disables sqlx's per-file transaction wrapper
+-- (required for CONCURRENTLY).
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "extrinsics_pallet_method_account_idx"
+ON public.extrinsics USING btree (pallet, method, account_id, block_number);

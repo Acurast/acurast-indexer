@@ -51,6 +51,57 @@ pub enum QueueType {
     Epoch,
 }
 
+/// DB entity types for insert tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbEntity {
+    Block,
+    Extrinsic,
+    Event,
+    SpecVersion,
+    Job,
+    ExtrinsicAddress,
+    StorageSnapshot,
+    Manager,
+    Commitment,
+    Deployment,
+    Epoch,
+}
+
+impl DbEntity {
+    pub fn all() -> &'static [DbEntity] {
+        &[
+            DbEntity::Block,
+            DbEntity::Extrinsic,
+            DbEntity::Event,
+            DbEntity::SpecVersion,
+            DbEntity::Job,
+            DbEntity::ExtrinsicAddress,
+            DbEntity::StorageSnapshot,
+            DbEntity::Manager,
+            DbEntity::Commitment,
+            DbEntity::Deployment,
+            DbEntity::Epoch,
+        ]
+    }
+
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            DbEntity::Block => "block",
+            DbEntity::Extrinsic => "extrinsic",
+            DbEntity::Event => "event",
+            DbEntity::SpecVersion => "spec_version",
+            DbEntity::Job => "job",
+            DbEntity::ExtrinsicAddress => "extrinsic_address",
+            DbEntity::StorageSnapshot => "storage_snapshot",
+            DbEntity::Manager => "manager",
+            DbEntity::Commitment => "commitment",
+            DbEntity::Deployment => "deployment",
+            DbEntity::Epoch => "epoch",
+        }
+    }
+}
+
 /// Metrics for a single queue type
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct QueueTypeMetrics {
@@ -68,23 +119,77 @@ pub struct QueueTypeMetrics {
     pub items_processed: u64,
 }
 
+/// Per-entity DB insert metrics
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DbEntityMetrics {
+    pub entity: String,
+    pub rows_per_sec: f64,
+    pub total_rows: u64,
+}
+
+/// Aggregated DB insert metrics
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DbMetrics {
+    pub entities: Vec<DbEntityMetrics>,
+    pub total_rows_per_sec: f64,
+    pub total_rows: u64,
+}
+
+/// Per-archive-node RPC call metrics
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NodeMetrics {
+    pub url: String,
+    pub calls_per_sec: f64,
+    pub total_calls: u64,
+}
+
+/// Pressure on a named in-memory `BlockRef` channel (e.g. finalized,
+/// priority, backwards). Sampled periodically; not throughput-tracked.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BlockChannelMetrics {
+    pub name: String,
+    /// Items currently waiting in the channel.
+    pub pending: u64,
+}
+
+/// Inclusive numeric range emitted as part of [`QueueMetrics`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeMetric<T: Serialize> {
+    pub min: T,
+    pub max: T,
+}
+
 /// Aggregated queue metrics for all queue types
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct QueueMetrics {
     pub events: QueueTypeMetrics,
     pub extrinsics: QueueTypeMetrics,
     pub epochs: QueueTypeMetrics,
+    pub db: DbMetrics,
+    pub nodes: Vec<NodeMetrics>,
+    /// Pressure on the block-distribution channels (finalized, priority,
+    /// backwards). Sampled by the metrics monitor, not by per-send hooks.
+    pub block_channels: Vec<BlockChannelMetrics>,
+    /// Min/max `block_number` across worker tasks active in the last 30s.
+    /// `None` if no worker has reported a block recently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_range: Option<RangeMetric<u32>>,
+    /// Min/max `epoch` across worker tasks active in the last 30s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch_range: Option<RangeMetric<i64>>,
     /// Timestamp when metrics were last updated
     pub updated_at: u64,
 }
 
-/// Tracks throughput using a sliding window of timestamps
+/// Tracks throughput using a sliding window of (timestamp, count) entries.
+/// Each entry represents a batch of items processed at a given time, so a
+/// single bulk insert of N rows takes one VecDeque entry rather than N.
 #[derive(Debug, Default)]
 struct ThroughputTracker {
     /// Window size in milliseconds (30 seconds)
     window_ms: u64,
-    /// Timestamps of processed items (in millis)
-    timestamps: VecDeque<u64>,
+    /// Entries of (timestamp, count) for processed batches
+    entries: VecDeque<(u64, u64)>,
     /// Total items processed
     total: u64,
 }
@@ -93,26 +198,39 @@ impl ThroughputTracker {
     fn new(window_seconds: u64) -> Self {
         Self {
             window_ms: window_seconds * 1000,
-            timestamps: VecDeque::new(),
+            entries: VecDeque::new(),
             total: 0,
         }
     }
 
-    /// Record a processed item
+    /// Record a single processed item
     fn record(&mut self, now: u64) {
-        self.timestamps.push_back(now);
-        self.total += 1;
-        // Remove timestamps older than window
+        self.record_batch(now, 1);
+    }
+
+    /// Record a batch of N processed items at the given time
+    fn record_batch(&mut self, now: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.entries.push_back((now, count));
+        self.total += count;
+        // Remove entries older than window
         let cutoff = now.saturating_sub(self.window_ms);
-        while self.timestamps.front().map_or(false, |&t| t < cutoff) {
-            self.timestamps.pop_front();
+        while self.entries.front().map_or(false, |&(t, _)| t < cutoff) {
+            self.entries.pop_front();
         }
     }
 
     /// Calculate throughput (items per second)
     fn throughput(&self, now: u64) -> f64 {
         let cutoff = now.saturating_sub(self.window_ms);
-        let count = self.timestamps.iter().filter(|&&t| t >= cutoff).count();
+        let count: u64 = self
+            .entries
+            .iter()
+            .filter(|&&(t, _)| t >= cutoff)
+            .map(|&(_, c)| c)
+            .sum();
         let window_secs = self.window_ms as f64 / 1000.0;
         count as f64 / window_secs
     }
@@ -128,6 +246,18 @@ struct QueueMetricsState {
     events: QueueTypeMetricsState,
     extrinsics: QueueTypeMetricsState,
     epochs: QueueTypeMetricsState,
+}
+
+/// Internal state for DB insert tracking
+#[derive(Debug, Default)]
+struct DbMetricsState {
+    entities: HashMap<DbEntity, ThroughputTracker>,
+}
+
+/// Internal state for archive node RPC tracking
+#[derive(Debug, Default)]
+struct NodeMetricsState {
+    nodes: HashMap<String, ThroughputTracker>,
 }
 
 #[derive(Debug)]
@@ -177,6 +307,10 @@ struct TaskState {
 pub struct TaskRegistry {
     tasks: RwLock<HashMap<u64, TaskState>>,
     queue_metrics: RwLock<QueueMetricsState>,
+    db_metrics: RwLock<DbMetricsState>,
+    node_metrics: RwLock<NodeMetricsState>,
+    /// Latest sampled length per named block-channel.
+    block_channels: RwLock<HashMap<String, u64>>,
 }
 
 impl TaskRegistry {
@@ -184,7 +318,16 @@ impl TaskRegistry {
         Self {
             tasks: RwLock::new(HashMap::new()),
             queue_metrics: RwLock::new(QueueMetricsState::default()),
+            db_metrics: RwLock::new(DbMetricsState::default()),
+            node_metrics: RwLock::new(NodeMetricsState::default()),
+            block_channels: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Record the current depth of a named block-distribution channel.
+    /// Called by the metrics monitor every time it samples.
+    pub fn set_block_channel_pending(&self, name: impl Into<String>, pending: u64) {
+        self.block_channels.write().insert(name.into(), pending);
     }
 
     /// Start a new task, returns task ID
@@ -351,10 +494,120 @@ impl TaskRegistry {
         state.max_queued_key = Some(max_key);
     }
 
+    /// Record DB row inserts for an entity (use the actual rows_affected count from the query)
+    pub fn record_db_insert(&self, entity: DbEntity, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let now = now_millis();
+        let mut metrics = self.db_metrics.write();
+        let tracker = metrics
+            .entities
+            .entry(entity)
+            .or_insert_with(|| ThroughputTracker::new(30));
+        tracker.record_batch(now, rows);
+    }
+
+    /// Record an RPC call to an archive node
+    pub fn record_node_call(&self, node_url: &str) {
+        let now = now_millis();
+        let mut metrics = self.node_metrics.write();
+        let tracker = metrics
+            .nodes
+            .entry(node_url.to_string())
+            .or_insert_with(|| ThroughputTracker::new(30));
+        tracker.record(now);
+    }
+
     /// Get current queue metrics for all queue types
     pub fn get_queue_metrics(&self) -> QueueMetrics {
         let now = now_millis();
         let metrics = self.queue_metrics.read();
+        let db = self.db_metrics.read();
+        let nodes = self.node_metrics.read();
+        let block_channels_state = self.block_channels.read();
+
+        // Block channel pressure: emit one entry per registered channel.
+        let mut block_channels: Vec<BlockChannelMetrics> = block_channels_state
+            .iter()
+            .map(|(name, &pending)| BlockChannelMetrics {
+                name: name.clone(),
+                pending,
+            })
+            .collect();
+        block_channels.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Block / epoch range across recently-active worker tasks. We
+        // intentionally compute this on demand from `tasks` rather than
+        // tracking a running aggregate, so a stale worker's last-seen value
+        // doesn't pollute the dashboard after the worker stops reporting.
+        const RANGE_WINDOW_MS: u64 = 30_000;
+        let cutoff = now.saturating_sub(RANGE_WINDOW_MS);
+        let mut block_min: Option<u32> = None;
+        let mut block_max: Option<u32> = None;
+        let mut epoch_min: Option<i64> = None;
+        let mut epoch_max: Option<i64> = None;
+        for state in self.tasks.read().values() {
+            // Skip ended tasks regardless of their last_updated timestamp.
+            if state.ended_at.read().is_some() {
+                continue;
+            }
+            let work = state.current_work.read();
+            if work.last_updated < cutoff {
+                continue;
+            }
+            if let Some(b) = work.block {
+                block_min = Some(block_min.map_or(b, |m| m.min(b)));
+                block_max = Some(block_max.map_or(b, |m| m.max(b)));
+            }
+            if let Some(e) = work.epoch {
+                epoch_min = Some(epoch_min.map_or(e, |m| m.min(e)));
+                epoch_max = Some(epoch_max.map_or(e, |m| m.max(e)));
+            }
+        }
+        let block_range = match (block_min, block_max) {
+            (Some(min), Some(max)) => Some(RangeMetric { min, max }),
+            _ => None,
+        };
+        let epoch_range = match (epoch_min, epoch_max) {
+            (Some(min), Some(max)) => Some(RangeMetric { min, max }),
+            _ => None,
+        };
+
+        // Build DB metrics in a stable order
+        let mut entities: Vec<DbEntityMetrics> = DbEntity::all()
+            .iter()
+            .filter_map(|e| {
+                db.entities.get(e).map(|tracker| DbEntityMetrics {
+                    entity: e.as_key().to_string(),
+                    rows_per_sec: tracker.throughput(now),
+                    total_rows: tracker.total(),
+                })
+            })
+            .collect();
+        // Include any entities tracked but not in the all() list (e.g. future additions)
+        for (e, tracker) in db.entities.iter() {
+            if !DbEntity::all().contains(e) {
+                entities.push(DbEntityMetrics {
+                    entity: e.as_key().to_string(),
+                    rows_per_sec: tracker.throughput(now),
+                    total_rows: tracker.total(),
+                });
+            }
+        }
+        let total_rows_per_sec: f64 = entities.iter().map(|e| e.rows_per_sec).sum();
+        let total_rows: u64 = entities.iter().map(|e| e.total_rows).sum();
+
+        let mut node_list: Vec<NodeMetrics> = nodes
+            .nodes
+            .iter()
+            .map(|(url, tracker)| NodeMetrics {
+                url: url.clone(),
+                calls_per_sec: tracker.throughput(now),
+                total_calls: tracker.total(),
+            })
+            .collect();
+        node_list.sort_by(|a, b| a.url.cmp(&b.url));
 
         QueueMetrics {
             events: QueueTypeMetrics {
@@ -378,6 +631,15 @@ impl TaskRegistry {
                 throughput_per_sec: metrics.epochs.throughput.throughput(now),
                 items_processed: metrics.epochs.throughput.total(),
             },
+            db: DbMetrics {
+                entities,
+                total_rows_per_sec,
+                total_rows,
+            },
+            nodes: node_list,
+            block_channels,
+            block_range,
+            epoch_range,
             updated_at: now,
         }
     }

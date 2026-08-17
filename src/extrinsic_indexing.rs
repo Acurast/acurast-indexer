@@ -43,14 +43,21 @@ pub async fn queue_extrinsics_phase(
             ExtrinsicsIndexPhase::MAX
         );
 
+        // Backpressure: if the worker channel is saturated, idle for 500ms
+        // before re-checking. Use the same `select!` as the normal pacing so
+        // cancellation is honored immediately in either case.
+        let backpressured = tx.len() > 5_000;
+        let sleep_ms = if backpressured { 500 } else { wait };
+
         tokio::select! {
             biased;
 
-            _ = cancel_token.cancelled() =>
-                break 'outer
-            ,
-            _ = tokio::time::sleep(Duration::from_secs(wait)) => {
-            },
+            _ = cancel_token.cancelled() => break 'outer,
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {},
+        }
+
+        if backpressured {
+            continue;
         }
 
         trace!(
@@ -62,11 +69,19 @@ pub async fn queue_extrinsics_phase(
         let extrinsics: Vec<ExtrinsicRow> = if let (Some(ref min_key), Some(ref max_key)) =
             (&min_queued_key, &max_queued_key)
         {
-            // Exclude items within the already queued range
+            // Exclude items within the already queued range - use UNION ALL for better index usage
             sqlx::query_as(
-                "SELECT block_number, index, pallet, method, data, tx_hash, account_id, block_time, phase FROM extrinsics
-                 WHERE phase < $1 AND NOT ((block_number, index) >= ($2, $3) AND (block_number, index) <= ($4, $5))
-                 AND block_number >= $6
+                "(SELECT block_number, index, pallet, method, data, tx_hash, account_id, block_time, phase FROM extrinsics
+                  WHERE phase < $1 AND (block_number, index) < ($2, $3)
+                  AND block_number >= $6
+                  ORDER BY block_number DESC, index DESC
+                  LIMIT 1000)
+                 UNION ALL
+                 (SELECT block_number, index, pallet, method, data, tx_hash, account_id, block_time, phase FROM extrinsics
+                  WHERE phase < $1 AND (block_number, index) > ($4, $5)
+                  AND block_number >= $6
+                  ORDER BY block_number DESC, index DESC
+                  LIMIT 1000)
                  ORDER BY block_number DESC, index DESC
                  LIMIT 1000",
             )
@@ -155,9 +170,9 @@ pub async fn queue_extrinsics_phase(
         }
 
         if extrinsics.is_empty() {
-            wait = 10;
+            wait = 10_000;
         } else {
-            wait = 0;
+            wait = 500;
         }
 
         // queue each row
@@ -289,7 +304,7 @@ pub async fn process_extrinsic_extract_addresses(
     }
 
     if !col_extrinsic_block_number.is_empty() {
-        sqlx::query(
+        let result = sqlx::query(
             "
                 INSERT INTO extrinsic_address(block_number, extrinsic_index, batch_index, data_path, resolved_data_path, account_id, pallet, method, block_time)
                 SELECT * FROM UNNEST($1::bigint[], $2::int[], $3::int[], $4::text[], $5::text[], $6::text[], $7::int[], $8::int[], $9::timestamptz[])
@@ -307,6 +322,10 @@ pub async fn process_extrinsic_extract_addresses(
         .bind(&col_block_time[..])
         .execute(db_pool)
         .await?;
+        crate::task_monitor::TASK_REGISTRY.record_db_insert(
+            crate::task_monitor::DbEntity::ExtrinsicAddress,
+            result.rows_affected(),
+        );
 
         debug!(
             worker = format!("phase-{:?}", worker_id),
@@ -316,11 +335,16 @@ pub async fn process_extrinsic_extract_addresses(
         );
     }
 
+    // Forward-only phase advance: when a block is re-processed (gap recovery,
+    // restart, queue_gaps re-iteration) the in-memory ExtrinsicRow carries
+    // phase=Raw, but the DB row may already be at a higher phase. Without
+    // `AND phase < $1` the UPDATE would regress the DB phase, kicking the
+    // extrinsic back into the queue and creating an indexing-stall cycle.
     sqlx::query(
         "
             UPDATE extrinsics
             SET phase = $1
-            WHERE block_number = $2 AND index = $3;
+            WHERE block_number = $2 AND index = $3 AND phase < $1;
         ",
     )
     .bind(PHASE as i32)

@@ -97,7 +97,11 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       { name: 'pallet', type: 'string|number', description: 'Filter by pallet name or index' },
       { name: 'method', type: 'string|number', description: 'Filter by method name or index (requires pallet)' },
       { name: 'account_id', type: 'string', description: 'Filter by signer account (hex or SS58)' },
+      { name: 'data', type: 'json', description: 'Filter by data (JSON containment). Requires pallet and method to be set.' },
+      { name: 'event.pallet', type: 'string|number', description: 'Only return extrinsics that emitted an event from this pallet' },
+      { name: 'event.variant', type: 'string|number', description: 'Only return extrinsics that emitted this event variant (requires event.pallet if using name)' },
       { name: 'events', type: 'boolean', description: 'Include events for each extrinsic (default: false)' },
+      { name: 'explode_batch', type: 'boolean', description: 'Expand utility.batch/batchAll into individual items with mapped events (default: false)' },
       { name: 'sort_order', type: 'string', description: '"asc" or "desc" (default: "desc")' },
       { name: 'limit', type: 'number', description: 'Maximum results (default: 10)' },
       { name: 'cursor', type: 'object', description: 'Cursor object with block_number and index' },
@@ -117,6 +121,11 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
         description: 'Include associated events',
         params: { limit: 5, events: true }
       },
+    ],
+    notes: [
+      'Response field data is null when the extrinsic carries no payload',
+      'Response field events is null unless events=true',
+      'When explode_batch=true, batch items include a batch_index field (0-based position within parent batch)',
     ],
   },
 
@@ -167,15 +176,25 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
     parameters: [
       { name: 'block_from', type: 'number', description: 'Minimum block number' },
       { name: 'block_to', type: 'number', description: 'Maximum block number' },
-      { name: 'pallet', type: 'string|number', description: 'Filter by pallet' },
-      { name: 'method', type: 'string|number', description: 'Filter by method' },
+      { name: 'pallet', type: 'string|number', description: 'Filter by pallet (single pair, backwards compatible)' },
+      { name: 'method', type: 'string|number', description: 'Filter by method (single pair, backwards compatible)' },
       { name: 'account_id', type: 'string', description: 'Filter by signer account' },
+      { name: 'pairs', type: 'array', description: 'Optional array of {pallet, method?} pairs (OR’d together, and combined with the single pallet/method if both are supplied). Each pair must specify a pallet; method is optional.' },
     ],
     examples: [
       {
         title: 'Count Acurast calls',
         params: { pallet: 'Acurast' }
       },
+      {
+        title: 'Count multiple pallet/method pairs',
+        description: 'OR-list across a few pairs',
+        params: { pairs: [{ pallet: 'Acurast', method: 'register' }, { pallet: 'Balances', method: 'transfer_keep_alive' }] }
+      },
+    ],
+    notes: [
+      'When no filter is provided, returns an approximate count from pg_class (instant).',
+      'When pairs is provided, the planner uses BitmapOr over the (pallet, method, …) index. Keep the list short (a few pairs).',
     ],
   },
 
@@ -231,6 +250,7 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
     description: (
       <>
         <p>Retrieves blockchain events. Events are emitted by pallets during extrinsic execution and provide detailed information about state changes.</p>
+        <p className="mt-2 text-gray-400">Events can be filtered by their emission source: extrinsics (user-initiated) or system (block initialization/finalization).</p>
       </>
     ),
     parameters: [
@@ -241,9 +261,10 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       { name: 'account_id', type: 'string', description: 'Filter by account ID (hex or SS58)' },
       { name: 'data', type: 'json', description: 'Filter by data (JSON containment)' },
       { name: 'job', type: 'string', description: 'Filter by job (SS58 or hex) or specific job (address#seq_id)' },
+      { name: 'source', type: 'string', description: 'Filter by event source: "extrinsic" (user-initiated) or "system" (block init/finalization)' },
       { name: 'sort_order', type: 'string', description: '"asc" or "desc"' },
       { name: 'limit', type: 'number', description: 'Maximum results' },
-      { name: 'cursor', type: 'object', description: 'Cursor with block_number, extrinsic_index, index' },
+      { name: 'cursor', type: 'object', description: 'Cursor with block_number and index' },
     ],
     examples: [
       {
@@ -259,24 +280,39 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
         description: 'Events associated with a specific job',
         params: { job: '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY#123', limit: 10 }
       },
+      {
+        title: 'System events only',
+        description: 'Events from block initialization or finalization',
+        params: { source: 'system', limit: 10 }
+      },
+    ],
+    notes: [
+      'source: "extrinsic" returns events from the ApplyExtrinsic phase (user-initiated transactions)',
+      'source: "system" returns events from Initialization and Finalization phases (block processing)',
+      'Without the source filter, all events are returned regardless of their emission phase',
+      'Response field extrinsic_index is null for system events (Initialization/Finalization)',
+      'Response fields data and error can be null',
     ],
   },
 
   event: {
     title: 'Get Event',
     description: (
-      <p>Retrieves a single event by its unique identifier: block number, extrinsic index, and event index within the extrinsic.</p>
+      <p>Retrieves a single event by block number and event index. The event index is unique per block.</p>
     ),
     parameters: [
       { name: 'block_number', type: 'number', required: true, description: 'The block containing the event' },
-      { name: 'extrinsic_index', type: 'number', required: true, description: 'The extrinsic index within the block' },
-      { name: 'index', type: 'number', required: true, description: 'The event index within the extrinsic' },
+      { name: 'index', type: 'number', required: true, description: 'The event index within the block' },
     ],
     examples: [
       {
         title: 'Get specific event',
-        params: { block_number: 8917224, extrinsic_index: 2, index: 4 }
+        params: { block_number: 8917224, index: 4 }
       },
+    ],
+    notes: [
+      'Response field extrinsic_index is null for system events (event_phase = Initialization or Finalization)',
+      'Response fields data and error can be null',
     ],
   },
 
@@ -294,6 +330,64 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
     ],
   },
 
+  eventsCount: {
+    title: 'Get Events Count',
+    description: (
+      <p>Returns the count of events matching the specified filters. Supports a single (pallet, variant) pair or multiple pairs OR’d together.</p>
+    ),
+    parameters: [
+      { name: 'block_from', type: 'number', description: 'Minimum block number' },
+      { name: 'block_to', type: 'number', description: 'Maximum block number' },
+      { name: 'pallet', type: 'string|number', description: 'Filter by pallet (single pair, backwards compatible)' },
+      { name: 'variant', type: 'string|number', description: 'Filter by event variant (single pair, backwards compatible)' },
+      { name: 'source', type: 'string', description: '"extrinsic" or "system"' },
+      { name: 'pairs', type: 'array', description: 'Optional array of {pallet, variant?} pairs (OR’d together, and combined with the single pallet/variant if both are supplied). Each pair must specify a pallet; variant is optional.' },
+    ],
+    examples: [
+      {
+        title: 'Count Balances.Transfer events',
+        params: { pallet: 'Balances', variant: 'Transfer' }
+      },
+      {
+        title: 'Count across multiple pairs',
+        description: 'OR-list across a few pairs',
+        params: { pairs: [{ pallet: 'Balances', variant: 'Transfer' }, { pallet: 'Acurast', variant: 'JobRegistrationStored' }] }
+      },
+    ],
+    notes: [
+      'When no filter is provided, returns an approximate count from pg_class (instant).',
+      'Uses events_pallet_variant_idx; planner does BitmapOr across pairs. Keep the list short (a few pairs).',
+    ],
+  },
+
+  specVersion: {
+    title: 'Get Spec Version',
+    description: (
+      <>
+        <p>Returns the runtime spec version and its SCALE-encoded metadata at a given point. Either lookup by exact <code>spec_version</code> or by <code>block_number</code> (returns the latest spec version active at or before that block).</p>
+      </>
+    ),
+    parameters: [
+      { name: 'spec_version', type: 'number', description: 'Exact runtime spec version' },
+      { name: 'block_number', type: 'number', description: 'Find the spec version active at or below this block (alternative to spec_version)' },
+    ],
+    examples: [
+      {
+        title: 'By exact version',
+        params: { spec_version: 1050000 }
+      },
+      {
+        title: 'By block number',
+        description: 'Returns the spec version active at this block',
+        params: { block_number: 8915500 }
+      },
+    ],
+    notes: [
+      'At least one of spec_version or block_number must be provided',
+      'Response shape: { spec_version, block_number, block_hash, metadata } — metadata is a 0x-prefixed hex string (SCALE-encoded runtime metadata v15)',
+    ],
+  },
+
   // ============================================
   // STORAGE
   // ============================================
@@ -302,7 +396,7 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
     description: (
       <>
         <p>Retrieves historical snapshots of on-chain storage. Storage snapshots capture the state of specific storage locations at particular blocks.</p>
-        <p className="mt-2 text-gray-400">Supports filtering by storage location, keys, data content, and the triggering extrinsic/event. Use sampling to keep only some snapshots by time period.</p>
+        <p className="mt-2 text-gray-400">Supports filtering by storage location, keys, data content, and the triggering extrinsic/event. Epoch-triggered snapshots have their own epoch_index field. Use sampling to keep only some snapshots by time period.</p>
       </>
     ),
     parameters: [
@@ -312,10 +406,12 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       { name: 'time_to', type: 'datetime', description: 'Filter by timestamp (ISO 8601)' },
       { name: 'pallet', type: 'string|number', description: 'Storage pallet name or index' },
       { name: 'storage_location', type: 'string', description: 'Storage location name (e.g., "StoredJobRegistration")' },
-      { name: 'storage_keys', type: 'json', description: 'JSON array of storage keys to match (containment)' },
+      { name: 'storage_keys', type: 'json', description: 'Positional JSON array. Each element becomes storage_keys->>N equality (or storage_keys->N->>0 for a nested [value] element). Use null to skip a position. Examples: ["x"] → storage_keys->>0 = "x"; ["x","y"] → both positions must match; [null,"y"] → only position 1; [["x"]] → storage_keys->0->>0 = "x" (nested keys, e.g. Commitments).' },
       { name: 'data', type: 'json', description: 'JSON object to match in data (containment)' },
       { name: 'config_rule', type: 'string', description: 'Filter by indexer config rule name' },
       { name: 'exclude_deleted', type: 'boolean', description: 'Exclude entries that were later deleted' },
+      { name: 'epoch_index', type: 'number', description: 'Filter by epoch number (for epoch-triggered snapshots)' },
+      { name: 'epoch_end', type: 'boolean', description: 'Filter by the epoch_end flag. true=only end-of-epoch snapshots, false=only non-end snapshots (start or mid-epoch), omitted=no filter (returns all)' },
       { name: 'extrinsic.pallet', type: 'string', description: 'Filter by triggering extrinsic pallet' },
       { name: 'extrinsic.method', type: 'string', description: 'Filter by triggering extrinsic method' },
       { name: 'extrinsic.account_id', type: 'string', description: 'Filter by triggering account' },
@@ -323,10 +419,9 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       { name: 'event.variant', type: 'string', description: 'Filter by triggering event variant' },
       { name: 'include_epochs', type: 'boolean', description: 'Include nested epoch info (epoch, epoch_start, epoch_end, epoch_start_time) in response' },
       { name: 'sample', type: 'string', description: 'Sample by time period: per_epoch, day (~8 epochs), week (~56 epochs), month (~240 epochs)' },
-      { name: 'fill', type: 'boolean', description: 'Fill missing time periods with last known value (only with sample)' },
       { name: 'sort_order', type: 'string', description: '"asc" or "desc"' },
       { name: 'limit', type: 'number', description: 'Maximum results' },
-      { name: 'cursor', type: 'number', description: 'Snapshot ID cursor' },
+      { name: 'cursor', type: 'object|number', description: 'Pagination cursor. For non-sampling queries: {"block_number": <i64>, "id": <i64>} taken from the last item of the previous page (single id is insufficient because rows are ordered by (block_number, id) and ids are not strictly co-monotonic with block_number). For `sample` queries: a single number — the previous page\'s epoch_bucket.' },
     ],
     examples: [
       {
@@ -344,18 +439,28 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
         params: { exclude_deleted: true, limit: 10 }
       },
       {
-        title: 'Daily samples with fill',
-        description: 'One snapshot per day, filling gaps with previous values',
-        params: { sample: 'day', fill: true, limit: 30 }
+        title: 'Epoch start snapshots',
+        description: 'Snapshots taken at the start of epochs',
+        params: { epoch_end: false, limit: 10 }
+      },
+      {
+        title: 'Daily samples',
+        description: 'One snapshot per day (gaps left empty)',
+        params: { sample: 'day', limit: 30 }
       },
     ],
     notes: [
       'The data filter uses PostgreSQL JSONB containment (@>)',
-      'Storage keys are stored as JSON arrays',
+      'storage_keys is a positional array. Each non-null element must match at its position (storage_keys->>N for primitives, storage_keys->N->>0 for [single] nested arrays). This always targets the expression indexes on storage_keys when pallet+storage_location are specified — no GIN containment fallback.',
+      'Invalid shapes (non-array input, non-primitive elements, nested arrays with more than one element) return an invalid_params error instead of silently matching broadly.',
       'Deleted entries have data set to JSON null',
+      'Epoch-triggered snapshots have epoch_index set (the epoch number) and extrinsic_index is null',
+      'Response field epoch_end (boolean) indicates whether the snapshot was captured at the last block of an epoch (true) or earlier (false)',
+      'epoch_end filter: true=only end-of-epoch snapshots, false=only non-end snapshots, omitted=no filter',
       'When using sample, response format changes to a dictionary keyed by epoch number',
       'Epoch durations: day ~8, week ~56, month ~240 epochs (~3 hours per epoch)',
-      'When fill is enabled, synthetic/filled rows have negative IDs (the negated epoch bucket number)',
+      'Nullable response fields: extrinsic_index (null for epoch-triggered snapshots), event_index (null unless the snapshot was triggered by a specific event), epoch (present only when include_epochs or sample is set)',
+      'Pagination cursor for non-sampling queries is now {"block_number": ..., "id": ...} (compound). The previous single-id cursor was unsound: rows are ordered by (block_number, id) and a bare id predicate skipped intermediate rows whose ids fell below the cursor.',
     ],
   },
 
@@ -395,6 +500,60 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
   },
 
   // ============================================
+  // DEPLOYMENTS
+  // ============================================
+  deployments: {
+    title: 'Get Deployments',
+    description: (
+      <>
+        <p>Retrieves deployment details for Acurast jobs. Deployments contain parsed JobRegistration data including schedule and requirements.</p>
+        <p className="mt-2 text-gray-400">Populated from JobRegistrationStoredV2 events. Use chain queries for live processor data.</p>
+      </>
+    ),
+    parameters: [
+      { name: 'account_id', type: 'string', description: 'Filter by deployer address (hex or SS58)' },
+      { name: 'seq_id', type: 'number', description: 'Filter by sequence ID' },
+      { name: 'is_active', type: 'boolean', description: 'Filter by active status' },
+      { name: 'exclude_addresses', type: 'array', description: 'Exclude deployments deployed by any of these addresses. Accepts hex and SS58 addresses, and the two formats may be mixed in the same list.' },
+      { name: 'block_from', type: 'number', description: 'Minimum block number' },
+      { name: 'block_to', type: 'number', description: 'Maximum block number' },
+      { name: 'related_extrinsics', type: 'boolean', description: 'Include related extrinsics per deployment (default: false). Expensive for list queries — enable only when needed.' },
+      { name: 'order_by', type: 'string', description: 'Sort column: block_number, created_block_number, start_time' },
+      { name: 'sort_order', type: 'string', description: '"asc" or "desc"' },
+      { name: 'limit', type: 'number', description: 'Maximum results (default: 50)' },
+      { name: 'cursor', type: 'object', description: 'Pagination cursor: {"seq_id": ..., "val": ...}' },
+    ],
+    examples: [
+      {
+        title: 'Latest deployments',
+        params: { limit: 20 }
+      },
+      {
+        title: 'Active deployments only',
+        params: { is_active: true, limit: 20 }
+      },
+      {
+        title: 'By deployer address',
+        params: { account_id: '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY', limit: 20 }
+      },
+      {
+        title: 'With related extrinsics',
+        description: 'Include extrinsic history for each deployment',
+        params: { related_extrinsics: true, limit: 20 }
+      },
+      {
+        title: 'Excluding addresses',
+        description: 'Filter out deployments from a blacklist of addresses (hex and SS58 may be mixed)',
+        params: { exclude_addresses: ['0x0102030405060708091011121314151617181920212223242526272829303132', '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'], limit: 20 }
+      },
+    ],
+    notes: [
+      'related_extrinsics (response field) aggregates all extrinsics related to this deployment from the jobs table. Present only when the related_extrinsics=true parameter is set.',
+      'Nullable response fields: snapshot_id, allowed_sources, planned_executions (populated for "Single" assignment_strategy only), min_reputation, processor_version, related_extrinsics (null unless requested)',
+    ],
+  },
+
+  // ============================================
   // EPOCHS
   // ============================================
   epochs: {
@@ -422,6 +581,9 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
         title: 'Epoch range',
         params: { epoch_from: 9900, epoch_to: 9907 }
       },
+    ],
+    notes: [
+      'Response field epoch_end is null for the most recent epoch (computed via LEAD over epoch_start)',
     ],
   },
 
@@ -505,6 +667,54 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
   },
 
   // ============================================
+  // REWARDS
+  // ============================================
+  baseRewards: {
+    title: 'Get Base Rewards',
+    description: (
+      <>
+        <p>
+          Returns the base rewards earned by each processor belonging to a manager, aggregated per epoch.
+          Each row represents the total <code>Balances::Deposit</code> amount triggered by{' '}
+          <code>heartbeat_with_metrics</code> extrinsics for a given processor within an epoch.
+        </p>
+        <p className="mt-2">
+          A processor typically sends 2–3 heartbeats per epoch; amounts are summed so each row
+          reflects the true total base reward for that processor in that epoch.
+        </p>
+      </>
+    ),
+    parameters: [
+      { name: 'manager', type: 'string', required: true, description: 'Manager address (0x hex or SS58)' },
+      { name: 'processor', type: 'string', description: 'Optional: filter to a single processor address (0x hex or SS58)' },
+      { name: 'epoch_from', type: 'number', description: 'Filter to epochs >= this value' },
+      { name: 'epoch_to', type: 'number', description: 'Filter to epochs <= this value' },
+      { name: 'limit', type: 'number', description: 'Maximum results to return (default: 50)' },
+      { name: 'cursor_epoch', type: 'number', description: 'Pagination cursor — epoch value from previous page cursor' },
+      { name: 'cursor_processor', type: 'string', description: 'Pagination cursor — processor value from previous page cursor' },
+    ],
+    examples: [
+      {
+        title: 'All processors for a manager (recent epochs)',
+        params: { manager: '0x4c069e20ce75ac39ff13124faa3fef366e43cdecf677a85f8b7a376803d83ef5', limit: 10 }
+      },
+      {
+        title: 'Single processor history',
+        params: {
+          manager: '0x4c069e20ce75ac39ff13124faa3fef366e43cdecf677a85f8b7a376803d83ef5',
+          processor: '0x005e2053f1c2146dc8e8b8aba30df73615db7be9ec98a19700cfa58fc1f30b18',
+          limit: 10
+        }
+      },
+    ],
+    notes: [
+      'amount is returned as a string to preserve u128 precision (value in planck, 1 ACU = 10^12 planck)',
+      'Results are sorted by epoch DESC, then processor ASC within the same epoch',
+      'Use cursor_epoch + cursor_processor from the response cursor object to paginate',
+    ],
+  },
+
+  // ============================================
   // STAKING / COMMITMENTS
   // ============================================
   commitments: {
@@ -530,16 +740,22 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       { name: 'max_commission', type: 'string', description: 'Maximum commission (Perbill)' },
       { name: 'min_delegation_utilization', type: 'string', description: 'Minimum delegation utilization (Perbill)' },
       { name: 'max_delegation_utilization', type: 'string', description: 'Maximum delegation utilization (Perbill)' },
+      { name: 'min_target_weight_per_compute_utilization', type: 'string', description: 'Minimum target-weight-per-compute utilization (Perbill, can exceed 1_000_000_000)' },
+      { name: 'max_target_weight_per_compute_utilization', type: 'string', description: 'Maximum target-weight-per-compute utilization (Perbill)' },
       { name: 'min_combined_utilization', type: 'string', description: 'Minimum combined utilization (Perbill)' },
       { name: 'max_combined_utilization', type: 'string', description: 'Maximum combined utilization (Perbill)' },
+      { name: 'min_max_delegation_capacity', type: 'string', description: 'Minimum max_delegation_capacity (self_slash_weight * 9)' },
+      { name: 'max_max_delegation_capacity', type: 'string', description: 'Maximum max_delegation_capacity' },
+      { name: 'min_min_max_weight_per_compute', type: 'string', description: 'Minimum min_max_weight_per_compute' },
+      { name: 'max_min_max_weight_per_compute', type: 'string', description: 'Maximum min_max_weight_per_compute' },
       { name: 'min_remaining_capacity', type: 'string', description: 'Minimum remaining capacity' },
       { name: 'max_remaining_capacity', type: 'string', description: 'Maximum remaining capacity' },
       { name: 'min_cooldown_period', type: 'string', description: 'Minimum cooldown period' },
       { name: 'max_cooldown_period', type: 'string', description: 'Maximum cooldown period' },
-      { name: 'order_by', type: 'string', description: 'Column to sort by: stake_amount, delegations_total_amount, commission, delegation_utilization, combined_utilization, remaining_capacity, cooldown_period, epoch, block_number, commitment_id, combined_stake (stake + delegations), combined_weight (delegations_slash_weight + self_slash_weight)' },
+      { name: 'order_by', type: 'string', description: 'Column to sort by: commitment_id, stake_amount, stake_rewardable_amount, delegations_total_amount, commission, epoch, block_number, last_scoring_epoch, cooldown_period, delegation_utilization, target_weight_per_compute_utilization, combined_utilization, max_delegation_capacity, min_max_weight_per_compute, remaining_capacity, combined_stake (stake + delegations), combined_weight (delegations_slash_weight + self_slash_weight). Default: stake_amount.' },
       { name: 'sort_order', type: 'string', description: '"asc" or "desc" (default: desc)' },
       { name: 'limit', type: 'number', description: 'Maximum results (default: 50)' },
-      { name: 'cursor', type: 'number', description: 'Commitment ID cursor for pagination' },
+      { name: 'cursor', type: 'number|object', description: 'When order_by=commitment_id: a bare commitment_id. Otherwise a compound cursor {"id": commitment_id, "val": sort_value} — val must match the order_by column type (string for numeric columns, number for epoch/block_number/last_scoring_epoch/cooldown_period).' },
     ],
     examples: [
       {
@@ -579,6 +795,86 @@ export const rpcDocs: Partial<Record<MethodKey, DocSection>> = {
       'The manager_address is the owner of the manager NFT (Uniques collection 0)',
       'Numeric fields (amounts, weights) are stored as raw on-chain values without decimal shifting',
       'Utilization metrics (delegation_utilization, target_weight_per_compute_utilization, combined_utilization) are stored as Perbill: 1,000,000,000 = 100%',
+      'Nullable response fields: manager_id, manager_address, snapshot_id, cooldown_started, max_delegation_capacity, min_max_weight_per_compute, delegation_utilization, target_weight_per_compute_utilization, combined_utilization, remaining_capacity, committed_metrics, metrics_epoch_sum',
+    ],
+  },
+
+  accounts: {
+    title: 'Get Accounts',
+    description: (
+      <>
+        <p>Paged, filterable listing of the materialized <code>accounts</code> table, ranked by a balance dimension. With no filters this is the top-N by balance; it also supports role-flag and attestation-classification filters plus keyset pagination via <code>cursor</code>.</p>
+      </>
+    ),
+    parameters: [
+      { name: 'sort', type: 'string', description: '"total" (free + reserved), "total_with_locked" (free + reserved + remaining_vesting + remaining_token_claim, default), "transferable" (spendable balance), "free", "reserved", or "frozen" (that balance component only)' },
+      { name: 'is_processor', type: 'boolean', description: 'Filter to (or exclude) accounts flagged as processors' },
+      { name: 'is_manager', type: 'boolean', description: 'Filter to (or exclude) accounts flagged as managers' },
+      { name: 'is_committer', type: 'boolean', description: 'Filter to (or exclude) accounts flagged as committers' },
+      { name: 'processor_type', type: 'string', description: 'Exact match: "Core", "Lite", or "Unknown"' },
+      { name: 'device_type', type: 'string', description: 'Exact match: "iOS", "Android", or "Unknown"' },
+      { name: 'account_id', type: 'string', description: 'Exact match on account_id (hex or SS58)' },
+      { name: 'exclude_addresses', type: 'array', description: 'Exclude any of these accounts. Accepts hex and SS58 addresses, and the two formats may be mixed in the same list.' },
+      { name: 'cursor', type: 'object', description: 'Keyset cursor from the previous page\'s response: {"sort_value": "<numeric string>", "account_id": "<string>"}' },
+      { name: 'limit', type: 'number', description: 'Number of accounts to return (1-100, default: 100)' },
+    ],
+    examples: [
+      {
+        title: 'All processors, ranked by whole balance',
+        params: { is_processor: true }
+      },
+      {
+        title: 'Lite Android processors',
+        params: { is_processor: true, processor_type: 'Lite', device_type: 'Android' }
+      },
+      {
+        title: 'Exclude a blacklist of addresses',
+        description: 'Filter out specific accounts (hex and SS58 may be mixed)',
+        params: { exclude_addresses: ['0x0102030405060708091011121314151617181920212223242526272829303132', '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'], limit: 20 }
+      },
+      {
+        title: 'Next page',
+        description: 'Pass the cursor object from the previous response',
+        params: { is_processor: true, cursor: { sort_value: '1000000000000', account_id: '0x...' } }
+      },
+    ],
+    notes: [
+      'Balances are returned as strings to preserve full NUMERIC(38,0) precision',
+      'Filters are ANDed together',
+      'processor_type/device_type are null until an attestation has been classified; "Unknown" means an attestation was seen but not recognized',
+      'Response cursor is null on the last page',
+      'With no filters, ordering walks a per-dimension DESC index (fast top-N); under heavy filtering it falls back to filter-then-sort — fine for this table\'s size',
+    ],
+  },
+
+  epochTotals: {
+    title: 'Get Epoch Totals',
+    description: (
+      <>
+        <p>Per-epoch network-wide totals time series: total remaining vesting (pallet_vesting), total remaining token-claim (AcurastTokenClaim), total committer self-stake, and total delegated (AcurastCompute). One row per epoch, evaluated at the epoch's end block. Ordered by epoch descending (most recent first).</p>
+      </>
+    ),
+    parameters: [
+      { name: 'epoch_from', type: 'number', description: 'Minimum epoch (inclusive)' },
+      { name: 'epoch_to', type: 'number', description: 'Maximum epoch (inclusive)' },
+      { name: 'limit', type: 'number', description: 'Max rows, most recent first (1-5000, default: 1000)' },
+    ],
+    examples: [
+      {
+        title: 'Latest 1000 epochs',
+        params: {}
+      },
+      {
+        title: 'Epoch range',
+        description: 'Totals for a specific epoch range',
+        params: { epoch_from: 3600, epoch_to: 3700 }
+      },
+    ],
+    notes: [
+      'Amounts are returned as strings (raw on-chain units) to preserve full NUMERIC(38,0) precision',
+      'total_vesting decays with block height and is recomputed at each epoch end (not carried forward)',
+      'Staking totals count commitments in cooldown/stale; a commitment drops out only once removed from storage',
+      'total_delegated is the runtime-aggregated delegations_total_amount summed across live commitments',
     ],
   },
 }

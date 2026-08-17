@@ -25,6 +25,7 @@ const categoryLabels: Record<string, string> = {
   epochs: 'Epochs',
   managers: 'Managers & Metrics',
   staking: 'Staking',
+  accounts: 'Accounts',
 }
 
 export function CommandMenu({ open, onOpenChange }: CommandMenuProps) {

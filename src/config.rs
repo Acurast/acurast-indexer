@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::OnceLock,
-};
+use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 use anyhow::Result;
 use config::{Config, Environment, File};
@@ -19,8 +15,6 @@ use crate::storage_indexing::FilteredStorageRules;
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 static STORAGE_RULES: OnceLock<FilteredStorageRules> = OnceLock::new();
 static PALLET_METHOD_MAP: OnceLock<HashMap<(String, String), (u32, u32)>> = OnceLock::new();
-/// Cached set of (pallet, variant) that have job extraction rules
-static JOB_EXTRACTION_EVENTS: OnceLock<HashSet<(i32, i32)>> = OnceLock::new();
 
 /// Initialize global configuration from environment. Must be called once at startup.
 /// Loads settings from yaml files and initializes all config-based globals.
@@ -31,22 +25,6 @@ pub async fn init_globals(settings: Settings, client: OnlineClient<PolkadotConfi
         ))
         .ok()
         .expect("STORAGE_RULES already initialized");
-
-    // Build set of events that have job extraction rules (before moving settings)
-    let mut job_extraction_events = HashSet::new();
-    for transformations in settings.indexer.event_transformations.values() {
-        for t in transformations {
-            job_extraction_events.insert((t.pallet as i32, t.variant as i32));
-        }
-    }
-    info!(
-        "Built job extraction events set with {} entries",
-        job_extraction_events.len()
-    );
-    JOB_EXTRACTION_EVENTS
-        .set(job_extraction_events)
-        .ok()
-        .expect("JOB_EXTRACTION_EVENTS already initialized");
 
     SETTINGS
         .set(settings)
@@ -102,19 +80,12 @@ pub fn event_transformations() -> &'static HashMap<u32, Vec<JobFromEventTransfor
     &settings().indexer.event_transformations
 }
 
-/// Check if an event (pallet, variant) has any processing rules (job extraction OR storage rules).
-/// Used to determine if an event needs to go through the processing pipeline.
-pub fn event_needs_processing(pallet: i32, variant: i32) -> bool {
-    // Check job extraction rules
-    let has_job_extraction = JOB_EXTRACTION_EVENTS
-        .get()
-        .map(|set| set.contains(&(pallet, variant)))
-        .unwrap_or(false);
-
-    // Check storage rules
-    let has_storage_rules = storage_rules().has_any_event_rule(pallet, variant);
-
-    has_job_extraction || has_storage_rules
+/// Whether phase processing (extrinsic transformations, event job extraction,
+/// storage_indexing) should run for a block. Below the configured threshold,
+/// rows are still inserted at `Created` but are not queued for the phase
+/// pipeline, so a later threshold lowering can pick them up.
+pub fn phase_processing_enabled_for_block(block_number: i64) -> bool {
+    block_number >= settings().indexer.index_phases_from_block as i64
 }
 
 #[derive(Deserialize, Clone)]
@@ -189,8 +160,13 @@ pub enum StorageKeyTransform {
 pub struct StorageItemConfig {
     pub pallet: u32,
     pub storage_location: String,
-    /// Paths to extract storage keys from event/extrinsic data.
-    /// Each path extracts one key (e.g., "[0]" for first element, "ORIGIN" for extrinsic signer).
+    /// Paths / values used to build the storage keys, one entry per key dimension.
+    /// Each entry is interpreted as:
+    /// - `"ORIGIN"`: use the extrinsic signer account_id.
+    /// - `"0x…"`: hex-encoded literal key value (no data extraction).
+    /// - integer-parseable string (e.g. `"42"`): numeric literal key value (no data extraction).
+    /// - anything else: JSON path into the triggering event/extrinsic data
+    ///   (e.g. `"[0]"` for first element, `"data.free"` for a nested field, `""` for root).
     #[serde(default)]
     pub key_paths: Vec<String>,
     /// Optional path to extract a specific value from the storage data.
@@ -227,15 +203,24 @@ pub enum StorageIndexingTrigger {
     },
 }
 
-/// Pruning strategy for storage snapshots
+/// Pruning policy keyed by `(pallet, storage_location)`. Snapshots whose
+/// `block_number` is older than `finalized - blocks` are deleted by the
+/// periodic prune loop, regardless of which rule produced them.
 #[derive(Deserialize, Clone, Debug)]
-#[serde(tag = "strategy", rename_all = "snake_case")]
-pub enum StoragePruning {
-    /// Keep snapshots for the last N blocks from the current finalized block
-    KeepBlocks {
-        /// Number of blocks to keep (e.g., 100000 keeps ~2 weeks of data at 6s blocks)
-        blocks: u32,
-    },
+pub struct StorageLocationPruning {
+    /// Pallet index of the storage entry to prune (e.g. `0` for `System`).
+    pub pallet: u32,
+    /// Storage entry name (e.g. `"Account"`, `"Metrics"`).
+    pub storage_location: String,
+    /// Optional config-rule filter — when set, only rows produced by rules
+    /// with this name are pruned. Useful when the same `(pallet,
+    /// storage_location)` is captured by several rules with different
+    /// retention needs. Default: prune every row at this storage location.
+    #[serde(default)]
+    pub config_rule: Option<String>,
+    /// Number of blocks to keep from the current finalized block.
+    /// e.g. 446_400 ≈ 31 days at 6s blocks.
+    pub blocks: u32,
 }
 
 /// When to take snapshots for epoch-triggered rules
@@ -258,9 +243,6 @@ pub struct StorageIndexingRule {
     pub description: Option<String>,
     pub trigger: StorageIndexingTrigger,
     pub storage: Vec<StorageItemConfig>,
-    /// Optional pruning strategy for this rule's snapshots
-    #[serde(default)]
-    pub pruning: Option<StoragePruning>,
     /// Phase at which this rule should be processed (default: 2)
     #[serde(default = "default_rule_phase")]
     pub phase: u32,
@@ -274,29 +256,6 @@ fn default_rule_phase() -> u32 {
     2
 }
 
-/// Configuration for reprocessing a specific event at a target phase.
-#[derive(Deserialize, Clone, Debug)]
-pub struct ReprocessEvent {
-    /// Block number of the extrinsic
-    pub block_number: i64,
-    /// Index of the extrinsic within the block
-    pub extrinsic_index: i32,
-    /// Event index within the extrinsic
-    pub index: i32,
-    /// Target phase to set the event to (will be processed from this phase)
-    pub phase: u32,
-}
-
-#[derive(Deserialize, Clone, Default)]
-pub struct ReprocessSettings {
-    #[serde(default)]
-    pub events: Vec<ReprocessEvent>,
-    /// Block hashes to reprocess (queued before backwards/finalized blocks)
-    /// Format: hex string without 0x prefix
-    #[serde(default)]
-    pub blocks: Vec<String>,
-}
-
 #[derive(Deserialize, Clone)]
 pub struct IndexerSettings {
     pub archive_nodes: Vec<String>,
@@ -304,6 +263,13 @@ pub struct IndexerSettings {
     pub index_backwards: bool,
     pub index_phases: bool,
     pub index_from_block: u32,
+    /// Only queue extrinsics/events for phase processing (transformations,
+    /// storage_indexing, etc.) when their block_number is at or above this
+    /// threshold. Blocks below it are still indexed as raw rows but land
+    /// at `phase = MAX` so the phase queuer skips them. Default 0 =
+    /// process every block (backwards compatible).
+    #[serde(default)]
+    pub index_phases_from_block: u32,
     #[serde(default)]
     pub index_from_epoch: i64,
     pub num_workers_backwards: u32,
@@ -312,21 +278,29 @@ pub struct IndexerSettings {
     pub num_workers_finalized: u32,
     pub num_conn_phases: u32,
     pub num_db_conn_phases: u32,
-    pub max_blocks_per_bulk_insert: usize,
+    /// Flush the per-worker bulk-insert buffers when the buffered *event*
+    /// count crosses this threshold. Events are the dominant write volume
+    /// per block (typically 10–100× extrinsics), so gating on events
+    /// produces a more predictable per-flush size than gating on extrinsics
+    /// or blocks. The 20-second drain timer in `process_blocks_inner`
+    /// handles the trickle case where buffered work doesn't reach this
+    /// ceiling.
+    pub max_events_per_bulk_insert: usize,
     pub event_transformations: HashMap<u32, Vec<JobFromEventTransformation>>,
     pub extrinsic_transformations: HashMap<u32, Vec<AddressFromExtrinsicTransformation>>,
     #[serde(default)]
     pub storage_indexing: Vec<StorageIndexingRule>,
+    /// Pruning policies keyed by (pallet, storage_location). Applied
+    /// independently of which rule produced the snapshot — useful when
+    /// many rules write to the same storage location and you want a
+    /// single retention policy for all of them (e.g. `System.Account`).
     #[serde(default)]
-    pub reprocess: ReprocessSettings,
+    pub storage_pruning: Vec<StorageLocationPruning>,
     /// Number of parallel event queuers. Each queuer handles a portion of the block range.
-    /// Default is 4 (single queuer). Set higher to speed up queuing from index_from_block to finalized.
-    #[serde(default = "default_num_event_queuers")]
     pub num_event_queuers: u32,
-}
-
-fn default_num_event_queuers() -> u32 {
-    4
+    /// Backpressure threshold for block queuing. When the extrinsic queue exceeds this length,
+    /// block queuers will pause to let workers catch up.
+    pub backpressure_threshold: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -357,4 +331,40 @@ pub fn get_config_from_file(file: &str) -> Result<Settings> {
         .build()?
         .try_deserialize::<Settings>()?;
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin down the YAML shape used in `base.yaml` so a refactor of
+    /// `StorageLocationPruning` can't silently break config loading.
+    #[test]
+    fn storage_location_pruning_round_trips() {
+        let json = serde_json::json!({
+            "pallet": 0,
+            "storage_location": "Account",
+            "blocks": 446_400,
+        });
+        let parsed: StorageLocationPruning = serde_json::from_value(json).expect("should parse");
+        assert_eq!(parsed.pallet, 0);
+        assert_eq!(parsed.storage_location, "Account");
+        assert!(parsed.config_rule.is_none());
+        assert_eq!(parsed.blocks, 446_400);
+
+        // Optional config_rule filter
+        let json_filtered = serde_json::json!({
+            "pallet": 48,
+            "storage_location": "Metrics",
+            "config_rule": "processor_heartbeat_metrics",
+            "blocks": 100_800,
+        });
+        let parsed: StorageLocationPruning =
+            serde_json::from_value(json_filtered).expect("should parse");
+        assert_eq!(
+            parsed.config_rule.as_deref(),
+            Some("processor_heartbeat_metrics")
+        );
+        assert_eq!(parsed.blocks, 100_800);
+    }
 }

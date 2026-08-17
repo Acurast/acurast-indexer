@@ -20,6 +20,7 @@ CREATE TABLE public.commitments (
 
     -- Core commitment data (extracted from JSON)
     commission NUMERIC(38,0) NOT NULL DEFAULT 0,  -- data.commission[0]
+    cooldown_period BIGINT NOT NULL,
     stake_amount NUMERIC(38,0) NOT NULL DEFAULT 0,  -- data.stake.amount
     stake_rewardable_amount NUMERIC(38,0) NOT NULL DEFAULT 0,  -- data.stake.rewardable_amount
     stake_accrued_reward NUMERIC(38,0) NOT NULL DEFAULT 0,  -- data.stake.accrued_reward
@@ -40,9 +41,9 @@ CREATE TABLE public.commitments (
     -- Used in: delegation_utilization = delegations_reward_weight / max_delegation_capacity
     max_delegation_capacity NUMERIC(38,0),
 
-    -- target_weight_per_compute = min(target_weight_per_compute[pool] * committed_metric[pool])
-    -- Used in: target_weight_per_compute_utilization = total_reward_weight / target_weight_per_compute
-    target_weight_per_compute NUMERIC(78,0),
+    -- min_max_weight_per_compute = min(min_max_weight_per_compute[pool] * committed_metric[pool])
+    -- Used in: target_weight_per_compute_utilization = total_reward_weight / min_max_weight_per_compute
+    min_max_weight_per_compute NUMERIC(78,0),
 
     -- Utilization metrics (stored as Perbill: 1_000_000_000 = 100%)
     delegation_utilization NUMERIC(38,0),  -- 0 to 1_000_000_000 (0%-100%)
@@ -50,7 +51,7 @@ CREATE TABLE public.commitments (
     combined_utilization NUMERIC(38,0),  -- 0 to 1_000_000_000 (0%-100%)
 
     -- Remaining capacity as absolute weight (not relative)
-    -- min(max_delegation_capacity - delegations_reward_weight, target_weight_per_compute - total_reward_weight)
+    -- min(max_delegation_capacity - delegations_reward_weight, min_max_weight_per_compute - total_reward_weight)
     remaining_capacity NUMERIC(78,0),
 
     -- Weights (resolved from current/past based on epoch match)
@@ -87,7 +88,7 @@ CREATE INDEX "commitments_stake_rewardable_amount_idx" ON commitments (stake_rew
 CREATE INDEX "commitments_delegations_total_amount_idx" ON commitments (delegations_total_amount DESC, commitment_id DESC);
 CREATE INDEX "commitments_commission_idx" ON commitments (commission DESC, commitment_id DESC);
 CREATE INDEX "commitments_max_delegation_capacity_idx" ON commitments (max_delegation_capacity DESC NULLS LAST, commitment_id DESC);
-CREATE INDEX "commitments_target_weight_per_compute_idx" ON commitments (target_weight_per_compute DESC NULLS LAST, commitment_id DESC);
+CREATE INDEX "commitments_min_max_weight_per_compute_idx" ON commitments (min_max_weight_per_compute DESC NULLS LAST, commitment_id DESC);
 CREATE INDEX "commitments_delegation_utilization_idx" ON commitments (delegation_utilization DESC NULLS LAST, commitment_id DESC);
 CREATE INDEX "commitments_target_weight_per_compute_utilization_idx" ON commitments (target_weight_per_compute_utilization DESC NULLS LAST, commitment_id DESC);
 CREATE INDEX "commitments_combined_utilization_idx" ON commitments (combined_utilization DESC NULLS LAST, commitment_id DESC);
@@ -99,6 +100,15 @@ CREATE INDEX "commitments_active_remaining_capacity_idx" ON commitments (remaini
 CREATE INDEX "commitments_active_combined_utilization_idx" ON commitments (combined_utilization DESC NULLS LAST, commitment_id DESC) WHERE is_active = TRUE;
 CREATE INDEX "commitments_active_delegation_utilization_idx" ON commitments (delegation_utilization DESC NULLS LAST, commitment_id DESC) WHERE is_active = TRUE;
 CREATE INDEX "commitments_active_delegations_total_idx" ON commitments (delegations_total_amount DESC, commitment_id DESC) WHERE is_active = TRUE;
+
+-- Create index for sorting by cooldown_period
+CREATE INDEX "commitments_cooldown_period_idx"
+ON commitments (cooldown_period DESC, commitment_id DESC);
+
+-- Create filtered index for active commitments
+CREATE INDEX "commitments_active_cooldown_period_idx"
+ON commitments (cooldown_period DESC, commitment_id DESC)
+WHERE is_active = TRUE;
 
 -- Phase processing
 CREATE INDEX "commitments_phase_idx" ON commitments (phase);

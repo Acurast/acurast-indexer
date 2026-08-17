@@ -43,9 +43,17 @@ impl RpcError {
         &self.message
     }
 
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.data.as_ref()
+    }
+
     /// Database error (-32000)
+    ///
+    /// The real error detail is logged server-side; the client only
+    /// receives a static message so schema/query details are not leaked.
     pub fn database(msg: impl Into<String>) -> Self {
-        Self::new(-32000, msg)
+        tracing::error!("Database error: {}", msg.into());
+        Self::new(-32000, "Database error")
     }
 
     /// Invalid params (-32602)
@@ -64,10 +72,85 @@ impl RpcError {
     }
 }
 
+/// Deserialize an RPC parameter object and surface a descriptive error
+/// when it fails. On success returns `T`. On failure returns an
+/// `RpcError(-32602)` whose `data` field is a one-element JSON array of
+/// `FieldError` so the response shape stays stable as we add multi-error
+/// validation layers later.
+pub fn validate_params<T>(value: serde_json::Value) -> RpcResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value::<T>(value).map_err(|e| {
+        RpcError::with_data(-32602, "Invalid params", serde_json::json!(e.to_string()))
+    })
+}
+
+/// Parse a non-sampling `getStorageSnapshots` cursor.
+/// Expects `{ "block_number": <i64>, "id": <i64> }`.
+fn parse_snapshot_cursor(c: &serde_json::Value) -> RpcResult<(i64, i64)> {
+    let bad = || {
+        RpcError::invalid_params(
+            "cursor must be an object with shape {\"block_number\": <i64>, \"id\": <i64>}",
+        )
+    };
+    let block = c
+        .get("block_number")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(bad)?;
+    let id = c.get("id").and_then(|v| v.as_i64()).ok_or_else(bad)?;
+    Ok((block, id))
+}
+
+/// Parse a `getAccounts` cursor.
+/// Expects `{ "sort_value": <numeric string>, "account_id": <string> }`.
+fn parse_accounts_cursor(c: &serde_json::Value) -> RpcResult<(bigdecimal::BigDecimal, String)> {
+    let bad = || {
+        RpcError::invalid_params(
+            "cursor must be an object with shape {\"sort_value\": <numeric string>, \"account_id\": <string>}",
+        )
+    };
+    let sort_value = c
+        .get("sort_value")
+        .and_then(|v| v.as_str())
+        .ok_or_else(bad)?
+        .parse::<bigdecimal::BigDecimal>()
+        .map_err(|_| RpcError::invalid_params("Invalid cursor sort_value: not a valid number"))?;
+    let account_id = c
+        .get("account_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(bad)?
+        .to_string();
+    Ok((sort_value, account_id))
+}
+
 impl From<serde_json::Error> for RpcError {
     fn from(e: serde_json::Error) -> Self {
         Self::invalid_params(e.to_string())
     }
+}
+
+/// Maximum number of items a single paginated RPC call may return.
+const MAX_PAGE_LIMIT: u32 = 1000;
+
+/// Resolve a user-supplied page limit: apply `default` when absent and
+/// clamp to `[1, MAX_PAGE_LIMIT]` so a huge `limit` cannot force an
+/// unbounded `fetch_all` (memory/response-size amplification).
+fn page_limit(limit: Option<u32>, default: u32) -> i64 {
+    limit.unwrap_or(default).clamp(1, MAX_PAGE_LIMIT) as i64
+}
+
+/// Convert a user-supplied integer filter value to a Postgres `bigint`,
+/// rejecting values above `i64::MAX` that would silently wrap negative
+/// with an `as i64` cast and invert the filter semantics.
+fn to_i64_param<T: TryInto<i64>>(name: &str, value: T) -> RpcResult<i64> {
+    value.try_into().map_err(|_| {
+        RpcError::invalid_params(format!(
+            "{} exceeds the maximum supported value ({})",
+            name,
+            i64::MAX
+        ))
+    })
 }
 
 impl std::fmt::Display for RpcError {
@@ -91,11 +174,11 @@ pub struct ExtrinsicCursor {
     pub index: i32,
 }
 
-/// Cursor for events - composite key of block_number, extrinsic_index, and event index
+/// Cursor for events - composite key of block_number and event index
+/// Note: Event index is unique per block, so extrinsic_index is not needed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventCursor {
     pub block_number: i64,
-    pub extrinsic_index: i32,
     pub index: i32,
 }
 
@@ -152,14 +235,18 @@ impl<'de> Deserialize<'de> for StringOrNumber {
             where
                 E: de::Error,
             {
-                Ok(StringOrNumber::Number(value as u32))
+                let value = u32::try_from(value)
+                    .map_err(|_| E::custom(format!("number {} exceeds u32 range", value)))?;
+                Ok(StringOrNumber::Number(value))
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(StringOrNumber::Number(value as u32))
+                let value = u32::try_from(value)
+                    .map_err(|_| E::custom(format!("number {} exceeds u32 range", value)))?;
+                Ok(StringOrNumber::Number(value))
             }
         }
 
@@ -205,8 +292,11 @@ pub async fn resolve_extrinsic_pallet_method(
                     // Resolve numeric pallet to name first
                     let reverse_pallet_map =
                         crate::metadata::get_reverse_pallet_index_map(client).await;
+                    let p_u8 = u8::try_from(*p).map_err(|_| {
+                        RpcError::invalid_params(format!("pallet index {} exceeds u8 range", p))
+                    })?;
                     reverse_pallet_map
-                        .get(&(*p as u8))
+                        .get(&p_u8)
                         .ok_or_else(|| {
                             RpcError::invalid_params(format!("unknown pallet index: {}", p))
                         })?
@@ -270,8 +360,11 @@ pub async fn resolve_event_pallet_variant(
                     // Resolve numeric pallet to name first
                     let reverse_pallet_map =
                         crate::metadata::get_reverse_pallet_index_map(client).await;
+                    let p_u8 = u8::try_from(*p).map_err(|_| {
+                        RpcError::invalid_params(format!("pallet index {} exceeds u8 range", p))
+                    })?;
                     reverse_pallet_map
-                        .get(&(*p as u8))
+                        .get(&p_u8)
                         .ok_or_else(|| {
                             RpcError::invalid_params(format!("unknown pallet index: {}", p))
                         })?
@@ -375,6 +468,16 @@ pub struct GetExtrinsicsParams {
     pub explode_batch: Option<bool>,
 }
 
+/// One (pallet, method) pair for multi-pair extrinsic filters.
+/// `pallet` is required; `method` is optional (count across all methods of a pallet).
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ExtrinsicPair {
+    #[serde(default)]
+    pub pallet: Option<StringOrNumber>,
+    #[serde(default)]
+    pub method: Option<StringOrNumber>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct GetExtrinsicsCountParams {
     #[serde(default)]
@@ -387,6 +490,39 @@ pub struct GetExtrinsicsCountParams {
     pub method: Option<StringOrNumber>,
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Multiple (pallet, method) pairs, OR'd together. Combined with the single
+    /// `pallet`/`method` fields if both are supplied (which becomes one extra pair).
+    #[serde(default)]
+    pub pairs: Option<Vec<ExtrinsicPair>>,
+}
+
+/// One (pallet, variant) pair for multi-pair event filters.
+/// `pallet` is required; `variant` is optional (count across all variants of a pallet).
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct EventPair {
+    #[serde(default)]
+    pub pallet: Option<StringOrNumber>,
+    #[serde(default)]
+    pub variant: Option<StringOrNumber>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GetEventsCountParams {
+    #[serde(default)]
+    pub block_from: Option<u32>,
+    #[serde(default)]
+    pub block_to: Option<u32>,
+    #[serde(default)]
+    pub pallet: Option<StringOrNumber>,
+    #[serde(default)]
+    pub variant: Option<StringOrNumber>,
+    /// Filter by event emission source: "extrinsic" or "system".
+    #[serde(default)]
+    pub source: Option<EventSourceFilter>,
+    /// Multiple (pallet, variant) pairs, OR'd together. Combined with the single
+    /// `pallet`/`variant` fields if both are supplied (which becomes one extra pair).
+    #[serde(default)]
+    pub pairs: Option<Vec<EventPair>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -407,6 +543,16 @@ pub struct GetExtrinsicAddressesParams {
     pub cursor: Option<ExtrinsicCursor>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Filter for event emission source
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSourceFilter {
+    /// Events emitted during extrinsic execution (ApplyExtrinsic phase)
+    Extrinsic,
+    /// Events emitted by system (Initialization or Finalization phase)
+    System,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -430,6 +576,9 @@ pub struct GetEventsParams {
     /// - With seq_id: "5GrwvaEF...#123" or "0xd43593...#456"
     #[serde(default)]
     pub job: Option<String>,
+    /// Filter by event emission source: "extrinsic" (ApplyExtrinsic) or "system" (Initialization/Finalization)
+    #[serde(default)]
+    pub source: Option<EventSourceFilter>,
     #[serde(default)]
     pub sort_order: Option<String>,
     #[serde(default)]
@@ -441,7 +590,6 @@ pub struct GetEventsParams {
 #[derive(Debug, Deserialize)]
 pub struct GetEventParams {
     pub block_number: i64,
-    pub extrinsic_index: i32,
     pub index: i32,
 }
 
@@ -581,9 +729,13 @@ pub struct GetStorageSnapshotsParams {
     /// Sort order: asc or desc (default: desc)
     #[serde(default)]
     pub sort_order: Option<String>,
-    /// Cursor for pagination (id of last item)
+    /// Cursor for pagination.
+    /// - For non-sampling queries: a JSON object {"block_number": N, "id": M} matching
+    ///   the last item of the previous page. Required because rows are ordered by
+    ///   (block_number, id); a single id wouldn't disambiguate.
+    /// - For `sample` queries: a single number (the previous page's `epoch_bucket`).
     #[serde(default)]
-    pub cursor: Option<i64>,
+    pub cursor: Option<serde_json::Value>,
     /// Number of items to return (default 10, max 1000)
     #[serde(default)]
     pub limit: Option<u32>,
@@ -593,14 +745,16 @@ pub struct GetStorageSnapshotsParams {
     /// Sample snapshots by time unit. Returns first snapshot per time period.
     #[serde(default)]
     pub sample: Option<SampleUnit>,
-    /// Fill missing time units with the last known value before that period.
-    /// Only applies when sample is set. Default: false
-    #[serde(default)]
-    pub fill: bool,
     /// Include epoch information in the response.
     /// When true or when sample is set, joins with epochs table.
     #[serde(default)]
     pub include_epochs: bool,
+    /// Filter by epoch index (for epoch-triggered snapshots)
+    #[serde(default)]
+    pub epoch_index: Option<i64>,
+    /// Filter by epoch end flag (true = end of epoch, false = start of epoch)
+    #[serde(default)]
+    pub epoch_end: Option<bool>,
 }
 
 // Response structs
@@ -671,7 +825,7 @@ pub struct EpochInfo {
 struct StorageSnapshotDbRow {
     pub id: i64,
     pub block_number: i64,
-    pub extrinsic_index: i32,
+    pub extrinsic_index: Option<i32>,
     pub event_index: Option<i32>,
     pub block_time: DateTime<Utc>,
     pub pallet: i32,
@@ -679,13 +833,14 @@ struct StorageSnapshotDbRow {
     pub storage_keys: serde_json::Value,
     pub data: serde_json::Value,
     pub config_rule: String,
+    pub epoch_end: bool,
     // Optional epoch fields (populated when joining with epochs)
     pub epoch: Option<i64>,
     pub epoch_start: Option<i64>,
-    pub epoch_end: Option<i64>,
+    // Block number where this epoch ends (LEAD over epoch_start). Aliased to avoid
+    // colliding with storage_snapshots.epoch_end (the boolean flag above).
+    pub epoch_end_block: Option<i64>,
     pub epoch_start_time: Option<DateTime<Utc>>,
-    // For sampling: the bucket this snapshot belongs to
-    pub epoch_bucket: Option<i64>,
 }
 
 /// API response struct with nested epoch info
@@ -693,7 +848,7 @@ struct StorageSnapshotDbRow {
 pub struct StorageSnapshotRow {
     pub id: i64,
     pub block_number: i64,
-    pub extrinsic_index: i32,
+    pub extrinsic_index: Option<i32>,
     pub event_index: Option<i32>,
     pub block_time: DateTime<Utc>,
     pub pallet: i32,
@@ -701,6 +856,7 @@ pub struct StorageSnapshotRow {
     pub storage_keys: serde_json::Value,
     pub data: serde_json::Value,
     pub config_rule: String,
+    pub epoch_end: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch: Option<EpochInfo>,
 }
@@ -710,7 +866,7 @@ impl From<StorageSnapshotDbRow> for StorageSnapshotRow {
         let epoch = row.epoch.map(|e| EpochInfo {
             epoch: e,
             epoch_start: row.epoch_start.unwrap_or(0),
-            epoch_end: row.epoch_end,
+            epoch_end: row.epoch_end_block,
             epoch_start_time: row.epoch_start_time.unwrap_or(DateTime::UNIX_EPOCH),
         });
         Self {
@@ -724,6 +880,7 @@ impl From<StorageSnapshotDbRow> for StorageSnapshotRow {
             storage_keys: row.storage_keys,
             data: row.data,
             config_rule: row.config_rule,
+            epoch_end: row.epoch_end,
             epoch,
         }
     }
@@ -737,6 +894,24 @@ struct EventInfo {
     #[serde(rename = "method")]
     variant: i32,
     data: Option<serde_json::Value>,
+}
+
+fn primitive_as_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Substrate storage location names are PascalCase identifiers (e.g., "Account",
+/// "MetricsEpochSum"). We inline these into SQL rather than binding them as
+/// parameters so the planner can match partial indexes whose predicate is
+/// `WHERE storage_location = '<name>'` — under a generic plan it cannot prove
+/// that a bound parameter equals the index's literal.
+fn is_valid_storage_location(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Parse job_id filter that supports multiple address formats with optional sequence ID.
@@ -881,12 +1056,16 @@ impl AppState {
         // Determine sort order first for cursor comparison
         let sort_by = "block_number";
         let sort_order = params.sort_order.as_deref().unwrap_or("asc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         if params.cursor.is_some()
             || params.block_from.is_some()
@@ -904,12 +1083,12 @@ impl AppState {
             if let Some(block_from) = params.block_from {
                 conditions
                     .push("block_number >= ")
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
             if let Some(block_to) = params.block_to {
                 conditions
                     .push("block_number <= ")
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
             if let Some(time_from) = time_from {
                 conditions
@@ -925,7 +1104,7 @@ impl AppState {
 
         query_builder.push(format!(
             " ORDER BY {} {}, block_number {}",
-            sort_by, sort_order, sort_order
+            sort_by, sort_order_sql, sort_order_sql
         ));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
@@ -990,12 +1169,12 @@ impl AppState {
         if let Some(block_from) = params.block_from {
             conditions
                 .push("block_number >= ")
-                .push_bind_unseparated(block_from as i64);
+                .push_bind_unseparated(to_i64_param("block_from", block_from)?);
         }
         if let Some(block_to) = params.block_to {
             conditions
                 .push("block_number <= ")
-                .push_bind_unseparated(block_to as i64);
+                .push_bind_unseparated(to_i64_param("block_to", block_to)?);
         }
 
         let query = query_builder.build_query_scalar::<i64>();
@@ -1013,12 +1192,16 @@ impl AppState {
     pub async fn get_epochs(&self, params: GetEpochsParams) -> RpcResult<Page<EpochRow>> {
         // Determine sort order before cursor so we know comparison direction
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         // Use LEAD() to compute epoch_end from next epoch's start
         let mut query_builder = QueryBuilder::<Postgres>::new(
@@ -1043,25 +1226,25 @@ impl AppState {
             if let Some(epoch_from) = params.epoch_from {
                 conditions
                     .push("epoch >= ")
-                    .push_bind_unseparated(epoch_from as i64);
+                    .push_bind_unseparated(to_i64_param("epoch_from", epoch_from)?);
             }
 
             if let Some(epoch_to) = params.epoch_to {
                 conditions
                     .push("epoch <= ")
-                    .push_bind_unseparated(epoch_to as i64);
+                    .push_bind_unseparated(to_i64_param("epoch_to", epoch_to)?);
             }
 
             if let Some(block_from) = params.block_from {
                 conditions
                     .push("epoch_start >= ")
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
 
             if let Some(block_to) = params.block_to {
                 conditions
                     .push("epoch_start <= ")
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
 
             if let Some(cursor) = params.cursor {
@@ -1071,7 +1254,7 @@ impl AppState {
             }
         }
 
-        query_builder.push(format!(" ORDER BY epoch {}", sort_order));
+        query_builder.push(format!(" ORDER BY epoch {}", sort_order_sql));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
 
@@ -1104,12 +1287,16 @@ impl AppState {
         params: GetProcessorsCountByEpochParams,
     ) -> RpcResult<Page<ProcessorsCountByEpochRow>> {
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(16) as i64;
+        let limit = page_limit(params.limit, 16);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         // Build query to get epochs with their block ranges and count processors
         // Using a CTE to get epoch ranges, then count distinct processors per epoch
@@ -1140,12 +1327,12 @@ impl AppState {
             if let Some(epoch_from) = params.epoch_from {
                 conditions
                     .push("er.epoch >= ")
-                    .push_bind_unseparated(epoch_from as i64);
+                    .push_bind_unseparated(to_i64_param("epoch_from", epoch_from)?);
             }
             if let Some(epoch_to) = params.epoch_to {
                 conditions
                     .push("er.epoch <= ")
-                    .push_bind_unseparated(epoch_to as i64);
+                    .push_bind_unseparated(to_i64_param("epoch_to", epoch_to)?);
             }
             if let Some(cursor) = params.cursor {
                 conditions
@@ -1155,7 +1342,7 @@ impl AppState {
         }
 
         query_builder.push(" GROUP BY er.epoch, er.epoch_start, er.epoch_end");
-        query_builder.push(format!(" ORDER BY er.epoch {}", sort_order));
+        query_builder.push(format!(" ORDER BY er.epoch {}", sort_order_sql));
         query_builder.push(" LIMIT ").push_bind(limit + 1);
 
         let query = query_builder.build_query_as::<ProcessorsCountByEpochRow>();
@@ -1181,6 +1368,512 @@ impl AppState {
         })
     }
 
+    /// Distinct active processors (heartbeat signers) per fixed calendar bucket,
+    /// for the quarter and year buckets overlapping `[from, to]`, plus per-bucket
+    /// new onboards. Active counts come from `processor_active_bucket`, which is
+    /// forward-collected per epoch (see `processor_churn::collect_epoch_active_processors`),
+    /// so this is a trivial indexed count — no on-demand scan of the ~250M-row
+    /// heartbeat index. The bucket containing `to` (typically the tip) is
+    /// naturally partial ("active this quarter/year to date").
+    pub async fn get_processor_churn(
+        &self,
+        params: GetProcessorChurnParams,
+    ) -> RpcResult<ProcessorChurnResponse> {
+        // Key on the REQUESTED range, not the resolved one: resolving requires a
+        // query, and the default (both None) is the case worth caching most --
+        // it is what the dashboard sends. A defaulted range therefore keys as
+        // "_:_" and follows the tip only as fast as the TTL, which is the agreed
+        // staleness tolerance.
+        let cache_key = format!(
+            "churn:{}:{}",
+            params.from.map_or("_".to_string(), |v| v.to_rfc3339()),
+            params.to.map_or("_".to_string(), |v| v.to_rfc3339()),
+        );
+        if let Some(cached) = self.churn_cache.get(&cache_key).await {
+            trace!("Cache hit for processor churn: {}", cache_key);
+            return Ok(cached);
+        }
+        let response = self.compute_processor_churn(params).await?;
+        self.churn_cache.insert(cache_key, response.clone()).await;
+        Ok(response)
+    }
+
+    async fn compute_processor_churn(
+        &self,
+        params: GetProcessorChurnParams,
+    ) -> RpcResult<ProcessorChurnResponse> {
+        // Default the range to the full indexed span.
+        let (min_bt, max_bt): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = with_timeout(
+            self.query_timeout,
+            sqlx::query_as("SELECT min(block_time), max(block_time) FROM blocks")
+                .fetch_one(&self.db_pool),
+        )
+        .await
+        .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        let (from, to) = match (params.from.or(min_bt), params.to.or(max_bt)) {
+            (Some(f), Some(t)) if f <= t => (f, t),
+            // empty DB, or nothing indexed / inverted range -> nothing to report
+            _ => {
+                return Ok(ProcessorChurnResponse {
+                    quarters: Vec::new(),
+                    years: Vec::new(),
+                })
+            }
+        };
+
+        // Onboard extrinsic (pallet, method) for the per-bucket new-onboards count.
+        let (onboard_pallet, onboard_method) = resolve_extrinsic_pallet_method(
+            &self.client,
+            Some(&StringOrNumber::String(
+                "AcurastProcessorManager".to_string(),
+            )),
+            Some(&StringOrNumber::String("onboard".to_string())),
+        )
+        .await?;
+        let onboard_pallet = onboard_pallet.ok_or_else(|| {
+            RpcError::internal_error("failed to resolve AcurastProcessorManager pallet")
+        })? as i32;
+        let onboard_method = onboard_method
+            .ok_or_else(|| RpcError::internal_error("failed to resolve onboard method"))?
+            as i32;
+
+        // ONE scan for both calendar grains; see `onboarded_by_bucket`.
+        let (onboarded_quarters, onboarded_years) = self
+            .onboarded_by_bucket(from, to, onboard_pallet, onboard_method)
+            .await?;
+
+        let quarters = self
+            .churn_buckets(
+                crate::processor_churn::BUCKET_QUARTER,
+                3,
+                from,
+                to,
+                &onboarded_quarters,
+            )
+            .await?;
+        let years = self
+            .churn_buckets(
+                crate::processor_churn::BUCKET_YEAR,
+                12,
+                from,
+                to,
+                &onboarded_years,
+            )
+            .await?;
+
+        Ok(ProcessorChurnResponse { quarters, years })
+    }
+
+    /// New-onboard counts per calendar quarter AND per calendar year, from a
+    /// single scan.
+    ///
+    /// `count(DISTINCT account_id)` is not summable across buckets -- an account
+    /// that onboarded in Q1 and again in Q2 is ONE distinct account for the year
+    /// but TWO across the quarters -- so the year figures cannot be derived from
+    /// the quarter figures in Rust. They can, however, come out of the same scan
+    /// via `GROUPING SETS`, which is why this replaced a per-grain query: the
+    /// aggregate used to run twice per request over identical rows.
+    ///
+    /// Crucially, the inner scan carries **no `block_time` predicate**. The range
+    /// is applied to the already-truncated bucket keys in the outer query
+    /// instead. That is not a stylistic choice -- it is the difference between
+    /// sub-second and 31 s, measured on mainnet 2026-08-05.
+    ///
+    /// With `block_time` in the inner WHERE, the planner produced a `BitmapAnd`
+    /// of `extrinsics_pallet_method_account_idx` (115k rows, 19 ms) and
+    /// `extrinsics_block_time_idx` -- and because the default range is all of
+    /// history, that second bitmap scan walked **314,118,251** index entries and
+    /// read 6.7 GB, for 30.7 s of the 31 s total. Dropping the predicate leaves
+    /// the planner only the `(pallet, method)` prefix, which is 114,322 rows.
+    /// That is what makes this fix stand on its own: the bad plan is only
+    /// reachable *because* of the predicate, so removing it defuses
+    /// `extrinsics_block_time_idx` without having to drop the index.
+    ///
+    /// Correctness is unaffected: the old per-grain ranges were bucket-aligned, so
+    /// grouping every row and then discarding whole out-of-range buckets yields
+    /// exactly the same counts for the buckets that remain.
+    ///
+    /// The cost of this is scanning all onboard rows even for a narrow requested
+    /// range. At 114,322 rows (measured) that is the right trade; revisit if
+    /// onboards ever reach the millions.
+    ///
+    /// Returns `(by_quarter, by_year)` keyed on bucket start.
+    async fn onboarded_by_bucket(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        onboard_pallet: i32,
+        onboard_method: i32,
+    ) -> RpcResult<(
+        std::collections::BTreeMap<DateTime<Utc>, i64>,
+        std::collections::BTreeMap<DateTime<Utc>, i64>,
+    )> {
+        // `date_trunc` units and intervals are compile-time constants here, never
+        // user input. Year rows come back with `q IS NULL` and quarter rows with
+        // `y IS NULL`, which is how the two grouping sets are told apart.
+        const SQL: &str = "\
+            SELECT g.y, g.q, g.onboarded FROM ( \
+                SELECT date_trunc('year', block_time)    AS y, \
+                       date_trunc('quarter', block_time) AS q, \
+                       count(DISTINCT account_id)::bigint AS onboarded \
+                  FROM extrinsics \
+                 WHERE pallet = $1 AND method = $2 \
+                 GROUP BY GROUPING SETS ((1), (2)) \
+            ) g \
+            WHERE (g.q IS NOT NULL \
+                   AND g.q >= date_trunc('quarter', $3::timestamptz) \
+                   AND g.q <  date_trunc('quarter', $4::timestamptz) + interval '3 months') \
+               OR (g.y IS NOT NULL \
+                   AND g.y >= date_trunc('year', $3::timestamptz) \
+                   AND g.y <  date_trunc('year', $4::timestamptz) + interval '1 year')";
+
+        let rows: Vec<(Option<DateTime<Utc>>, Option<DateTime<Utc>>, i64)> = with_timeout(
+            self.query_timeout,
+            sqlx::query_as(SQL)
+                .bind(onboard_pallet)
+                .bind(onboard_method)
+                .bind(from)
+                .bind(to)
+                .fetch_all(&self.db_pool),
+        )
+        .await
+        .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        let mut by_quarter = std::collections::BTreeMap::new();
+        let mut by_year = std::collections::BTreeMap::new();
+        for (year, quarter, onboarded) in rows {
+            match (year, quarter) {
+                (_, Some(q)) => {
+                    by_quarter.insert(q, onboarded);
+                }
+                (Some(y), None) => {
+                    by_year.insert(y, onboarded);
+                }
+                (None, None) => {}
+            }
+        }
+        Ok((by_quarter, by_year))
+    }
+
+    /// Build the churn buckets of one calendar length overlapping `[from, to]`.
+    /// `months` is an internal constant (3 for quarters, 12 for years), never
+    /// user input, so deriving the SQL interval from it is safe. Merges the
+    /// forward-collected `active` count with the pre-computed per-bucket
+    /// `onboarded` counts from [`AppState::onboarded_by_bucket`].
+    async fn churn_buckets(
+        &self,
+        kind: i16,
+        months: u32,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        onboarded_by_bucket: &std::collections::BTreeMap<DateTime<Utc>, i64>,
+    ) -> RpcResult<Vec<ProcessorChurnBucket>> {
+        let interval = if months >= 12 { "1 year" } else { "3 months" };
+
+        // Active: buckets whose [start, start+interval) overlaps [from, to].
+        let active_sql = format!(
+            "SELECT bucket_start, count(*)::bigint AS active \
+             FROM processor_active_bucket \
+             WHERE bucket_kind = $1 AND bucket_start <= $3 \
+               AND bucket_start + interval '{interval}' > $2 \
+             GROUP BY bucket_start"
+        );
+        let active_rows: Vec<(DateTime<Utc>, i64)> = with_timeout(
+            self.query_timeout,
+            sqlx::query_as(&active_sql)
+                .bind(kind)
+                .bind(from)
+                .bind(to)
+                .fetch_all(&self.db_pool),
+        )
+        .await
+        .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        // Merge by bucket_start (BTreeMap keeps them sorted).
+        let mut merged: std::collections::BTreeMap<DateTime<Utc>, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for (bs, active) in active_rows {
+            merged.entry(bs).or_default().0 = active;
+        }
+        for (bs, onboarded) in onboarded_by_bucket {
+            merged.entry(*bs).or_default().1 = *onboarded;
+        }
+
+        let mut out = Vec::with_capacity(merged.len());
+        for (bucket_start, (active, onboarded)) in merged {
+            let bucket_end = bucket_start
+                .checked_add_months(chrono::Months::new(months))
+                .ok_or_else(|| RpcError::internal_error("bucket_end overflow"))?;
+            out.push(ProcessorChurnBucket {
+                bucket_start,
+                bucket_end,
+                active,
+                onboarded,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Paged, filterable listing of the `accounts` table, ranked by a balance
+    /// dimension (`total`, `total_with_locked`, or `transferable`). Supports
+    /// role-flag and attestation-classification filters plus keyset pagination.
+    /// With no filters this is the top-N ranking (each dimension has a matching
+    /// DESC index); `account_id` is the stable secondary sort.
+    pub async fn get_accounts(&self, params: GetAccountsParams) -> RpcResult<Page<TopAccountRow>> {
+        let order_expr = params.sort.order_expr();
+        let limit = params.limit.unwrap_or(100).clamp(1, 100);
+
+        let mut query_builder = QueryBuilder::<Postgres>::new(
+            "SELECT account_id, \
+                    free::text AS free, \
+                    reserved::text AS reserved, \
+                    frozen::text AS frozen, \
+                    transferable::text AS transferable, \
+                    remaining_vesting::text AS remaining_vesting, \
+                    remaining_token_claim::text AS remaining_token_claim, \
+                    sort_num::text AS sort_value, \
+                    is_processor, is_manager, is_committer, \
+                    processor_type, device_type, \
+                    block_number, block_time \
+             FROM ( \
+                SELECT account_id, free, reserved, frozen, transferable, \
+                       remaining_vesting, remaining_token_claim, ",
+        );
+        query_builder.push(order_expr);
+        query_builder.push(
+            " AS sort_num, \
+                       is_processor, is_manager, is_committer, \
+                       processor_type, device_type, \
+                       block_number, block_time \
+                FROM accounts \
+                WHERE 1=1",
+        );
+
+        if let Some(is_processor) = params.is_processor {
+            query_builder.push(" AND is_processor = ");
+            query_builder.push_bind(is_processor);
+        }
+        if let Some(is_manager) = params.is_manager {
+            query_builder.push(" AND is_manager = ");
+            query_builder.push_bind(is_manager);
+        }
+        if let Some(is_committer) = params.is_committer {
+            query_builder.push(" AND is_committer = ");
+            query_builder.push_bind(is_committer);
+        }
+        if let Some(processor_type) = params.processor_type {
+            query_builder.push(" AND processor_type = ");
+            query_builder.push_bind(processor_type);
+        }
+        if let Some(device_type) = params.device_type {
+            query_builder.push(" AND device_type = ");
+            query_builder.push_bind(device_type);
+        }
+        if let Some(ref account_id) = params.account_id {
+            let normalized = normalize_address_with_prefix(account_id);
+            query_builder.push(" AND account_id = ");
+            query_builder.push_bind(normalized);
+        }
+        if let Some(ref exclude_addresses) = params.exclude_addresses {
+            let normalized: Vec<String> = exclude_addresses
+                .iter()
+                .map(|a| normalize_address_with_prefix(a))
+                .collect();
+            if !normalized.is_empty() {
+                query_builder.push(" AND account_id <> ALL(");
+                query_builder.push_bind(normalized);
+                query_builder.push(")");
+            }
+        }
+        if let Some(ref cursor) = params.cursor {
+            let (cursor_val, cursor_account_id) = parse_accounts_cursor(cursor)?;
+            // Tuple comparison: (sort_num, account_id) < (cursor_val, cursor_account_id).
+            // Always DESC (highest balance first); sort columns are never NULL so
+            // no NULLS-LAST branch is needed (unlike get_commitments).
+            query_builder.push(" AND ((");
+            query_builder.push(order_expr);
+            query_builder.push(" < ");
+            query_builder.push_bind(cursor_val.clone());
+            query_builder.push(") OR (");
+            query_builder.push(order_expr);
+            query_builder.push(" = ");
+            query_builder.push_bind(cursor_val);
+            query_builder.push(" AND account_id < ");
+            query_builder.push_bind(cursor_account_id);
+            query_builder.push("))");
+        }
+
+        query_builder.push(" ORDER BY ");
+        query_builder.push(order_expr);
+        query_builder.push(" DESC, account_id ASC LIMIT ");
+        query_builder.push_bind(limit + 1);
+        query_builder.push(" ) t ORDER BY sort_num DESC, account_id ASC");
+
+        let query = query_builder.build_query_as::<TopAccountRow>();
+        let mut items = with_timeout(self.query_timeout, query.fetch_all(&self.db_pool))
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        let has_more = items.len() > limit as usize;
+        if has_more {
+            items.pop();
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(
+                |l| serde_json::json!({"sort_value": l.sort_value, "account_id": l.account_id}),
+            )
+        } else {
+            None
+        };
+
+        Ok(Page::<TopAccountRow> {
+            cursor: next_cursor,
+            items,
+            unfiltered_count: None,
+        })
+    }
+
+    /// Count accounts matching the same filters as `get_accounts` (sort/cursor/limit
+    /// are irrelevant to a count and ignored). Result is cached.
+    pub async fn get_accounts_count(&self, params: GetAccountsCountParams) -> RpcResult<i64> {
+        let normalized_account_id = params
+            .account_id
+            .as_ref()
+            .map(|a| normalize_address_with_prefix(a));
+        let normalized_excludes: Vec<String> = params
+            .exclude_addresses
+            .as_ref()
+            .map(|xs| {
+                xs.iter()
+                    .map(|a| normalize_address_with_prefix(a))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let has_filters = params.is_processor.is_some()
+            || params.is_manager.is_some()
+            || params.is_committer.is_some()
+            || params.processor_type.is_some()
+            || params.device_type.is_some()
+            || normalized_account_id.is_some()
+            || !normalized_excludes.is_empty();
+
+        // Unfiltered count: use the approximate count from pg_class (instant,
+        // avoids a full table scan), consistent with the other *_count methods.
+        if !has_filters {
+            let result: i64 = with_timeout(
+                self.query_timeout,
+                sqlx::query_scalar(
+                    "SELECT reltuples::bigint FROM pg_class WHERE relname = 'accounts'",
+                )
+                .fetch_one(&self.db_pool),
+            )
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+            return Ok(result);
+        }
+
+        // Deterministic cache key (sort excludes so hits are order-insensitive).
+        let mut excludes_key = normalized_excludes.clone();
+        excludes_key.sort();
+        let cache_key = format!(
+            "acc_count:{}:{}:{}:{}:{}:{}:{}",
+            params
+                .is_processor
+                .map_or("_".to_string(), |v| v.to_string()),
+            params.is_manager.map_or("_".to_string(), |v| v.to_string()),
+            params
+                .is_committer
+                .map_or("_".to_string(), |v| v.to_string()),
+            params.processor_type.as_deref().unwrap_or("_"),
+            params.device_type.as_deref().unwrap_or("_"),
+            normalized_account_id.as_deref().unwrap_or("_"),
+            excludes_key.join(","),
+        );
+
+        if let Some(cached) = self.count_cache.get(&cache_key).await {
+            trace!("Cache hit for accounts count: {}", cache_key);
+            return Ok(cached);
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Postgres>::new("SELECT count(*) FROM accounts WHERE 1=1");
+
+        if let Some(is_processor) = params.is_processor {
+            query_builder.push(" AND is_processor = ");
+            query_builder.push_bind(is_processor);
+        }
+        if let Some(is_manager) = params.is_manager {
+            query_builder.push(" AND is_manager = ");
+            query_builder.push_bind(is_manager);
+        }
+        if let Some(is_committer) = params.is_committer {
+            query_builder.push(" AND is_committer = ");
+            query_builder.push_bind(is_committer);
+        }
+        if let Some(processor_type) = params.processor_type {
+            query_builder.push(" AND processor_type = ");
+            query_builder.push_bind(processor_type);
+        }
+        if let Some(device_type) = params.device_type {
+            query_builder.push(" AND device_type = ");
+            query_builder.push_bind(device_type);
+        }
+        if let Some(account_id) = normalized_account_id {
+            query_builder.push(" AND account_id = ");
+            query_builder.push_bind(account_id);
+        }
+        if !normalized_excludes.is_empty() {
+            query_builder.push(" AND account_id <> ALL(");
+            query_builder.push_bind(normalized_excludes);
+            query_builder.push(")");
+        }
+
+        let query = query_builder.build_query_scalar::<i64>();
+        let result = with_timeout(self.query_timeout, query.fetch_one(&self.db_pool))
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+        self.count_cache.insert(cache_key, result).await;
+        Ok(result)
+    }
+
+    /// Per-epoch network-wide totals time series from the `epoch_totals` rollup:
+    /// total remaining vesting (pallet 15), total remaining token-claim
+    /// (pallet 55), total committer self-stake and total delegated (pallet 48).
+    /// Ordered by epoch descending (most recent first).
+    pub async fn get_epoch_totals(
+        &self,
+        params: GetEpochTotalsParams,
+    ) -> RpcResult<Vec<EpochTotalsRow>> {
+        let limit = params.limit.unwrap_or(1000).clamp(1, 5000);
+
+        let rows = with_timeout(
+            self.query_timeout,
+            query_as::<_, EpochTotalsRow>(
+                "SELECT epoch, block_number, block_time, \
+                        total_vesting::text AS total_vesting, \
+                        total_token_claim::text AS total_token_claim, \
+                        total_self_staked::text AS total_self_staked, \
+                        total_delegated::text AS total_delegated \
+                 FROM epoch_totals \
+                 WHERE ($1::BIGINT IS NULL OR epoch >= $1) \
+                   AND ($2::BIGINT IS NULL OR epoch <= $2) \
+                 ORDER BY epoch DESC \
+                 LIMIT $3",
+            )
+            .bind(params.epoch_from)
+            .bind(params.epoch_to)
+            .bind(limit)
+            .fetch_all(&self.db_pool),
+        )
+        .await
+        .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        Ok(rows)
+    }
+
     pub async fn get_extrinsic(
         &self,
         block_number: u32,
@@ -1204,7 +1897,7 @@ impl AppState {
                         ) AS events
                     FROM extrinsics e WHERE e.block_number = $1 AND e.index = $2 LIMIT 1"#,
                 )
-                .bind(block_number as i64)
+                .bind(to_i64_param("block_number", block_number)?)
                 .bind(index)
                 .fetch_optional(&self.db_pool),
             )
@@ -1215,7 +1908,7 @@ impl AppState {
                 sqlx::query_as(
                     r#"SELECT block_number, index, pallet, method, data, '0x' || tx_hash as tx_hash, '0x' || account_id as account_id, block_time, phase, NULL::jsonb AS events FROM extrinsics WHERE block_number = $1 AND index = $2 LIMIT 1"#,
                 )
-                .bind(block_number as i64)
+                .bind(to_i64_param("block_number", block_number)?)
                 .bind(index)
                 .fetch_optional(&self.db_pool),
             )
@@ -1302,6 +1995,13 @@ impl AppState {
         )
         .await?;
 
+        // Validate: data filter requires pallet and method for efficient index usage
+        if params.data.is_some() && (pallet.is_none() || method.is_none()) {
+            return Err(RpcError::invalid_params(
+                "data filter requires both pallet and method to be specified",
+            ));
+        }
+
         // Resolve event filter if present
         let (evt_pallet, evt_variant) = if let Some(ref evt_filter) = params.event {
             resolve_event_pallet_variant(
@@ -1343,12 +2043,16 @@ impl AppState {
         // Determine sort order first for cursor comparison
         let sort_by = "block_number";
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         if params.cursor.is_some()
             || params.block_from.is_some()
@@ -1371,12 +2075,12 @@ impl AppState {
             if let Some(block_from) = params.block_from {
                 conditions
                     .push("block_number >= ")
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
             if let Some(block_to) = params.block_to {
                 conditions
                     .push("block_number <= ")
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
             if let Some(pallet) = pallet {
                 conditions
@@ -1414,7 +2118,7 @@ impl AppState {
 
         query_builder.push(format!(
             " ORDER BY {} {}, index {}",
-            sort_by, sort_order, sort_order
+            sort_by, sort_order_sql, sort_order_sql
         ));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
@@ -1535,18 +2239,44 @@ impl AppState {
     }
 
     pub async fn get_extrinsics_count(&self, params: GetExtrinsicsCountParams) -> RpcResult<i64> {
-        // Resolve pallet/method names to numbers if needed
-        let (pallet, method) = resolve_extrinsic_pallet_method(
+        // Resolve legacy single pallet/method and any provided pairs into one
+        // unified list of resolved (pallet, method) tuples.
+        let mut resolved_pairs: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+
+        let (legacy_pallet, legacy_method) = resolve_extrinsic_pallet_method(
             &self.client,
             params.pallet.as_ref(),
             params.method.as_ref(),
         )
         .await?;
+        if legacy_pallet.is_some() || legacy_method.is_some() {
+            resolved_pairs.push((legacy_pallet, legacy_method));
+        }
 
+        if let Some(pairs) = &params.pairs {
+            for pair in pairs {
+                let (p, m) = resolve_extrinsic_pallet_method(
+                    &self.client,
+                    pair.pallet.as_ref(),
+                    pair.method.as_ref(),
+                )
+                .await?;
+                if p.is_none() && m.is_none() {
+                    continue;
+                }
+                if p.is_none() {
+                    return Err(RpcError::invalid_params(
+                        "each pair in `pairs` must specify a pallet",
+                    ));
+                }
+                resolved_pairs.push((p, m));
+            }
+        }
+
+        let has_pair_filter = !resolved_pairs.is_empty();
         let has_filters = params.block_from.is_some()
             || params.block_to.is_some()
-            || pallet.is_some()
-            || method.is_some()
+            || has_pair_filter
             || params.account_id.is_some();
 
         // Use approximate count from pg_class when no filters (instant, avoids full table scan)
@@ -1563,13 +2293,25 @@ impl AppState {
             return Ok(result);
         }
 
-        // Build cache key from filter parameters
+        // Build deterministic cache key (sort pairs so cache hits are order-insensitive)
+        let mut pair_key = resolved_pairs.clone();
+        pair_key.sort();
+        let pairs_str = pair_key
+            .iter()
+            .map(|(p, m)| {
+                format!(
+                    "{}.{}",
+                    p.map_or("_".to_string(), |v| v.to_string()),
+                    m.map_or("_".to_string(), |v| v.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let cache_key = format!(
-            "ext_count:{}:{}:{}:{}:{}",
+            "ext_count:{}:{}:{}:{}",
             params.block_from.map_or("_".to_string(), |v| v.to_string()),
             params.block_to.map_or("_".to_string(), |v| v.to_string()),
-            pallet.map_or("_".to_string(), |v| v.to_string()),
-            method.map_or("_".to_string(), |v| v.to_string()),
+            pairs_str,
             params.account_id.as_deref().unwrap_or("_")
         );
 
@@ -1586,22 +2328,51 @@ impl AppState {
         if let Some(block_from) = params.block_from {
             conditions
                 .push("block_number >= ")
-                .push_bind_unseparated(block_from as i64);
+                .push_bind_unseparated(to_i64_param("block_from", block_from)?);
         }
         if let Some(block_to) = params.block_to {
             conditions
                 .push("block_number <= ")
-                .push_bind_unseparated(block_to as i64);
+                .push_bind_unseparated(to_i64_param("block_to", block_to)?);
         }
-        if let Some(pallet) = pallet {
-            conditions
-                .push("pallet = ")
-                .push_bind_unseparated(pallet as i32);
-        }
-        if let Some(method) = method {
-            conditions
-                .push("method = ")
-                .push_bind_unseparated(method as i32);
+        if resolved_pairs.len() == 1 {
+            let (pallet, method) = resolved_pairs[0];
+            if let Some(pallet) = pallet {
+                conditions
+                    .push("pallet = ")
+                    .push_bind_unseparated(pallet as i32);
+            }
+            if let Some(method) = method {
+                conditions
+                    .push("method = ")
+                    .push_bind_unseparated(method as i32);
+            }
+        } else if resolved_pairs.len() > 1 {
+            // OR-list across pairs; planner uses BitmapOr over the
+            // (pallet, method, ...) index.
+            conditions.push("(");
+            let mut first = true;
+            for (pallet, method) in &resolved_pairs {
+                if !first {
+                    conditions.push_unseparated(" OR ");
+                }
+                first = false;
+                match (pallet, method) {
+                    (Some(p), Some(m)) => {
+                        conditions.push_unseparated("(pallet = ");
+                        conditions.push_bind_unseparated(*p as i32);
+                        conditions.push_unseparated(" AND method = ");
+                        conditions.push_bind_unseparated(*m as i32);
+                        conditions.push_unseparated(")");
+                    }
+                    (Some(p), None) => {
+                        conditions.push_unseparated("pallet = ");
+                        conditions.push_bind_unseparated(*p as i32);
+                    }
+                    _ => unreachable!("pair must have a pallet at this point"),
+                }
+            }
+            conditions.push_unseparated(")");
         }
         if let Some(account_id) = &params.account_id {
             conditions
@@ -1616,6 +2387,167 @@ impl AppState {
             .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
 
         // Store in cache (TTL handled by cache config)
+        self.count_cache.insert(cache_key, result).await;
+
+        Ok(result)
+    }
+
+    pub async fn get_events_count(&self, params: GetEventsCountParams) -> RpcResult<i64> {
+        // Resolve legacy single pallet/variant and any provided pairs into one
+        // unified list of resolved (pallet, variant) tuples.
+        let mut resolved_pairs: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+
+        let (legacy_pallet, legacy_variant) = resolve_event_pallet_variant(
+            &self.client,
+            params.pallet.as_ref(),
+            params.variant.as_ref(),
+        )
+        .await?;
+        if legacy_pallet.is_some() || legacy_variant.is_some() {
+            resolved_pairs.push((legacy_pallet, legacy_variant));
+        }
+
+        if let Some(pairs) = &params.pairs {
+            for pair in pairs {
+                let (p, v) = resolve_event_pallet_variant(
+                    &self.client,
+                    pair.pallet.as_ref(),
+                    pair.variant.as_ref(),
+                )
+                .await?;
+                if p.is_none() && v.is_none() {
+                    continue;
+                }
+                if p.is_none() {
+                    return Err(RpcError::invalid_params(
+                        "each pair in `pairs` must specify a pallet",
+                    ));
+                }
+                resolved_pairs.push((p, v));
+            }
+        }
+
+        let has_pair_filter = !resolved_pairs.is_empty();
+        let has_filters = params.block_from.is_some()
+            || params.block_to.is_some()
+            || has_pair_filter
+            || params.source.is_some();
+
+        // Use approximate count from pg_class when no filters (instant, avoids full table scan)
+        if !has_filters {
+            let result: i64 = with_timeout(
+                self.query_timeout,
+                sqlx::query_scalar(
+                    "SELECT reltuples::bigint FROM pg_class WHERE relname = 'events'",
+                )
+                .fetch_one(&self.db_pool),
+            )
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+            return Ok(result);
+        }
+
+        let mut pair_key = resolved_pairs.clone();
+        pair_key.sort();
+        let pairs_str = pair_key
+            .iter()
+            .map(|(p, v)| {
+                format!(
+                    "{}.{}",
+                    p.map_or("_".to_string(), |v| v.to_string()),
+                    v.map_or("_".to_string(), |v| v.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let source_str = match params.source {
+            Some(EventSourceFilter::Extrinsic) => "ext",
+            Some(EventSourceFilter::System) => "sys",
+            None => "_",
+        };
+        let cache_key = format!(
+            "evt_count:{}:{}:{}:{}",
+            params.block_from.map_or("_".to_string(), |v| v.to_string()),
+            params.block_to.map_or("_".to_string(), |v| v.to_string()),
+            pairs_str,
+            source_str,
+        );
+
+        if let Some(cached) = self.count_cache.get(&cache_key).await {
+            trace!("Cache hit for events count: {}", cache_key);
+            return Ok(cached);
+        }
+
+        let mut query_builder = QueryBuilder::<Postgres>::new("SELECT count(*) FROM events");
+
+        query_builder.push(" WHERE ");
+        let mut conditions = query_builder.separated(" AND ");
+        if let Some(block_from) = params.block_from {
+            conditions
+                .push("block_number >= ")
+                .push_bind_unseparated(to_i64_param("block_from", block_from)?);
+        }
+        if let Some(block_to) = params.block_to {
+            conditions
+                .push("block_number <= ")
+                .push_bind_unseparated(to_i64_param("block_to", block_to)?);
+        }
+        if resolved_pairs.len() == 1 {
+            let (pallet, variant) = resolved_pairs[0];
+            if let Some(pallet) = pallet {
+                conditions
+                    .push("pallet = ")
+                    .push_bind_unseparated(pallet as i32);
+            }
+            if let Some(variant) = variant {
+                conditions
+                    .push("variant = ")
+                    .push_bind_unseparated(variant as i32);
+            }
+        } else if resolved_pairs.len() > 1 {
+            // OR-list across pairs; planner uses BitmapOr over
+            // `events_pallet_variant_idx` (or `events_pallet_idx` for pallet-only pairs).
+            conditions.push("(");
+            let mut first = true;
+            for (pallet, variant) in &resolved_pairs {
+                if !first {
+                    conditions.push_unseparated(" OR ");
+                }
+                first = false;
+                match (pallet, variant) {
+                    (Some(p), Some(v)) => {
+                        conditions.push_unseparated("(pallet = ");
+                        conditions.push_bind_unseparated(*p as i32);
+                        conditions.push_unseparated(" AND variant = ");
+                        conditions.push_bind_unseparated(*v as i32);
+                        conditions.push_unseparated(")");
+                    }
+                    (Some(p), None) => {
+                        conditions.push_unseparated("pallet = ");
+                        conditions.push_bind_unseparated(*p as i32);
+                    }
+                    _ => unreachable!("pair must have a pallet at this point"),
+                }
+            }
+            conditions.push_unseparated(")");
+        }
+        if let Some(source) = &params.source {
+            match source {
+                EventSourceFilter::Extrinsic => {
+                    conditions.push("event_phase = 'ApplyExtrinsic'::event_phase_type");
+                }
+                EventSourceFilter::System => {
+                    conditions.push("event_phase IN ('Initialization'::event_phase_type, 'Finalization'::event_phase_type)");
+                }
+            }
+        }
+
+        let query = query_builder.build_query_scalar::<i64>();
+
+        let result = with_timeout(self.query_timeout, query.fetch_one(&self.db_pool))
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
         self.count_cache.insert(cache_key, result).await;
 
         Ok(result)
@@ -1646,16 +2578,19 @@ impl AppState {
         let (spec_version, block_number, block_hash) =
             if let Some(spec_version) = params.spec_version {
                 // Query by exact spec_version
-                let row = sqlx::query!(
-                    r#"
+                let row = with_timeout(
+                    self.query_timeout,
+                    sqlx::query!(
+                        r#"
                 SELECT sv.spec_version, sv.block_number, b.hash as block_hash
                 FROM spec_versions sv
                 JOIN blocks b ON sv.block_number = b.block_number
                 WHERE sv.spec_version = $1
                 "#,
-                    spec_version
+                        spec_version
+                    )
+                    .fetch_optional(&self.db_pool),
                 )
-                .fetch_optional(&self.db_pool)
                 .await
                 .map_err(|e| RpcError::database(format!("Database error: {}", e)))?
                 .ok_or_else(|| {
@@ -1665,8 +2600,10 @@ impl AppState {
             } else {
                 // Query by block_number - find the closest spec_version <= block_number
                 let block_number = params.block_number.unwrap();
-                let row = sqlx::query!(
-                    r#"
+                let row = with_timeout(
+                    self.query_timeout,
+                    sqlx::query!(
+                        r#"
                 SELECT sv.spec_version, sv.block_number, b.hash as block_hash
                 FROM spec_versions sv
                 JOIN blocks b ON sv.block_number = b.block_number
@@ -1674,9 +2611,10 @@ impl AppState {
                 ORDER BY sv.block_number DESC
                 LIMIT 1
                 "#,
-                    block_number
+                        block_number
+                    )
+                    .fetch_optional(&self.db_pool),
                 )
-                .fetch_optional(&self.db_pool)
                 .await
                 .map_err(|e| RpcError::database(format!("Database error: {}", e)))?
                 .ok_or_else(|| {
@@ -1687,6 +2625,12 @@ impl AppState {
                 })?;
                 (row.spec_version, row.block_number, row.block_hash)
             };
+
+        // Metadata is immutable per spec_version; serve from cache when possible
+        // to avoid a live archive-node call (hundreds of KB-MB) per request.
+        if let Some(cached) = self.metadata_cache.get(&spec_version).await {
+            return Ok(cached);
+        }
 
         // Parse block hash
         let block_hash_bytes = hex::decode(&block_hash)
@@ -1715,12 +2659,16 @@ impl AppState {
                 let metadata_hex = format!("0x{}", hex::encode(&metadata_bytes));
 
                 // Return spec version info with metadata as hex string
-                Ok(serde_json::json!({
+                let response = serde_json::json!({
                     "spec_version": spec_version,
                     "block_number": block_number,
                     "block_hash": block_hash,
                     "metadata": metadata_hex
-                }))
+                });
+                self.metadata_cache
+                    .insert(spec_version, response.clone())
+                    .await;
+                Ok(response)
             }
             Ok(None) => Err(RpcError::internal_error(
                 "Metadata v15 not available at this block".to_string(),
@@ -1744,17 +2692,21 @@ impl AppState {
         )
         .await?;
 
-        let mut query_builder = QueryBuilder::<Postgres>::new("SELECT block_number, extrinsic_index, batch_index, data_path, resolved_data_path, account_id, pallet, method, block_number, block_time FROM extrinsic_address");
+        let mut query_builder = QueryBuilder::<Postgres>::new("SELECT block_number, extrinsic_index, batch_index, data_path, resolved_data_path, account_id, pallet, method, block_time FROM extrinsic_address");
 
         // Determine sort order first for cursor comparison
         let sort_by = "block_number";
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         if params.cursor.is_some()
             || params.block_from.is_some()
@@ -1775,12 +2727,12 @@ impl AppState {
             if let Some(block_from) = params.block_from {
                 conditions
                     .push("block_number >= ")
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
             if let Some(block_to) = params.block_to {
                 conditions
                     .push("block_number <= ")
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
             if let Some(account_id) = &params.account_id {
                 conditions
@@ -1801,7 +2753,7 @@ impl AppState {
 
         query_builder.push(format!(
             " ORDER BY {} {}, extrinsic_index {}",
-            sort_by, sort_order, sort_order
+            sort_by, sort_order_sql, sort_order_sql
         ));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
@@ -1839,10 +2791,9 @@ impl AppState {
         let result: Option<EventRow> = with_timeout(
             self.query_timeout,
             sqlx::query_as(
-                r#"SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, error, block_number, block_time FROM events WHERE block_number = $1 AND extrinsic_index = $2 AND index = $3 LIMIT 1"#,
+                r#"SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events WHERE block_number = $1 AND index = $2 LIMIT 1"#,
             )
             .bind(params.block_number)
-            .bind(params.extrinsic_index)
             .bind(params.index)
             .fetch_optional(&self.db_pool),
         )
@@ -1861,6 +2812,13 @@ impl AppState {
         )
         .await?;
 
+        // Validate: data filter requires pallet and variant for efficient index usage
+        if params.data.is_some() && (pallet.is_none() || variant.is_none()) {
+            return Err(RpcError::invalid_params(
+                "data filter requires both pallet and variant to be specified",
+            ));
+        }
+
         // Parse job filter if provided
         let job_filter = params.job.as_ref().map(|addr| parse_job_id_filter(addr));
 
@@ -1873,13 +2831,13 @@ impl AppState {
         // When filtering by job, start from jobs table (smaller) and join to events
         let mut query_builder = if needs_job_join {
             QueryBuilder::<Postgres>::new(
-                "SELECT e.block_number, e.extrinsic_index, e.index, e.pallet, e.variant, e.data, e.phase, e.error, e.block_time \
+                "SELECT e.block_number, e.extrinsic_index, e.index, e.pallet, e.variant, e.data, e.phase, e.event_phase, e.error, e.block_time \
                  FROM jobs j \
                  INNER JOIN events e ON j.block_number = e.block_number AND j.extrinsic_index = e.extrinsic_index AND j.event_index = e.index"
             )
         } else if needs_extrinsic_join {
             QueryBuilder::<Postgres>::new(
-                "SELECT e.block_number, e.extrinsic_index, e.index, e.pallet, e.variant, e.data, e.phase, e.error, e.block_time \
+                "SELECT e.block_number, e.extrinsic_index, e.index, e.pallet, e.variant, e.data, e.phase, e.event_phase, e.error, e.block_time \
                  FROM events e \
                  INNER JOIN extrinsics ext ON e.block_number = ext.block_number AND e.extrinsic_index = ext.index"
             )
@@ -1894,12 +2852,16 @@ impl AppState {
             "block_number"
         };
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         if params.cursor.is_some()
             || params.block_from.is_some()
@@ -1909,6 +2871,7 @@ impl AppState {
             || params.account_id.is_some()
             || params.data.is_some()
             || job_filter.is_some()
+            || params.source.is_some()
         {
             query_builder.push(" WHERE ");
             let mut conditions = query_builder.separated(" AND ");
@@ -1918,12 +2881,10 @@ impl AppState {
 
             if let Some(cursor) = &params.cursor {
                 conditions.push(format!(
-                    "({}block_number, {}extrinsic_index, {}index) {} (",
-                    col_prefix, col_prefix, col_prefix, cursor_op
+                    "({}block_number, {}index) {} (",
+                    col_prefix, col_prefix, cursor_op
                 ));
                 conditions.push_bind_unseparated(cursor.block_number);
-                conditions.push_unseparated(", ");
-                conditions.push_bind_unseparated(cursor.extrinsic_index);
                 conditions.push_unseparated(", ");
                 conditions.push_bind_unseparated(cursor.index);
                 conditions.push_unseparated(")");
@@ -1931,12 +2892,12 @@ impl AppState {
             if let Some(block_from) = params.block_from {
                 conditions
                     .push(format!("{}block_number >= ", col_prefix))
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
             if let Some(block_to) = params.block_to {
                 conditions
                     .push(format!("{}block_number <= ", col_prefix))
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
             if let Some(pallet) = pallet {
                 conditions
@@ -1976,19 +2937,31 @@ impl AppState {
                     conditions.push_bind_unseparated(address);
                 }
             }
+            // Add source filter (event phase)
+            if let Some(source) = &params.source {
+                match source {
+                    EventSourceFilter::Extrinsic => {
+                        // ApplyExtrinsic phase
+                        conditions.push(format!(
+                            "{}event_phase = 'ApplyExtrinsic'::event_phase_type",
+                            col_prefix
+                        ));
+                    }
+                    EventSourceFilter::System => {
+                        // Initialization or Finalization phase
+                        conditions.push(format!(
+                            "{}event_phase IN ('Initialization'::event_phase_type, 'Finalization'::event_phase_type)",
+                            col_prefix
+                        ));
+                    }
+                }
+            }
         }
 
         let order_prefix = if needs_join { "e." } else { "" };
         query_builder.push(format!(
-            " ORDER BY {} {}, {}block_number {}, {}extrinsic_index {}, {}index {}",
-            sort_by,
-            sort_order,
-            order_prefix,
-            sort_order,
-            order_prefix,
-            sort_order,
-            order_prefix,
-            sort_order
+            " ORDER BY {} {}, {}block_number {}, {}index {}",
+            sort_by, sort_order_sql, order_prefix, sort_order_sql, order_prefix, sort_order_sql
         ));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
@@ -2010,7 +2983,6 @@ impl AppState {
                 items.last().map(|l| {
                     serde_json::to_value(EventCursor {
                         block_number: l.block_number,
-                        extrinsic_index: l.extrinsic_index,
                         index: l.index,
                     })
                     .unwrap()
@@ -2031,12 +3003,16 @@ impl AppState {
         // Determine sort order first for cursor comparison
         let sort_by = "block_number";
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
 
         if params.cursor.is_some()
             || params.block_from.is_some()
@@ -2055,12 +3031,12 @@ impl AppState {
             if let Some(block_from) = params.block_from {
                 conditions
                     .push("block_number >= ")
-                    .push_bind_unseparated(block_from as i64);
+                    .push_bind_unseparated(to_i64_param("block_from", block_from)?);
             }
             if let Some(block_to) = params.block_to {
                 conditions
                     .push("block_number <= ")
-                    .push_bind_unseparated(block_to as i64);
+                    .push_bind_unseparated(to_i64_param("block_to", block_to)?);
             }
             if let Some(job_param) = &params.job {
                 // Parse address format: supports SS58, hex, and optional #<seq_id> suffix
@@ -2088,7 +3064,7 @@ impl AppState {
 
         query_builder.push(format!(
             " ORDER BY {} {}, extrinsic_index {}",
-            sort_by, sort_order, sort_order
+            sort_by, sort_order_sql, sort_order_sql
         ));
         // Fetch one extra to check if there are more items
         query_builder.push(" LIMIT ").push_bind(limit + 1);
@@ -2122,6 +3098,56 @@ impl AppState {
         })
     }
 
+    /// Resolve a time-range filter (`time_from` / `time_to`) into a
+    /// block_number range using two cheap lookups against
+    /// `blocks_block_time_idx`. Combined with `params.block_from` / `block_to`
+    /// (intersection), this gives the effective block_number bounds for the
+    /// snapshot query.
+    ///
+    /// Filtering snapshots by `block_number` (rather than `block_time`) lets
+    /// the planner satisfy the time-window predicate using the partial
+    /// expression indexes that already have `block_number DESC` as their
+    /// secondary key — a single Index Scan instead of a BitmapAnd that also
+    /// pulls in `storage_snapshots_block_time_idx` and pays bitmap-construction
+    /// cost proportional to the time window's row count.
+    async fn resolve_block_bounds_from_time(
+        &self,
+        time_from: Option<DateTime<Utc>>,
+        time_to: Option<DateTime<Utc>>,
+    ) -> RpcResult<(Option<i64>, Option<i64>)> {
+        let from = if let Some(tf) = time_from {
+            let row = sqlx::query!(
+                "SELECT block_number FROM blocks WHERE block_time >= $1 ORDER BY block_time ASC LIMIT 1",
+                tf
+            )
+            .fetch_optional(&self.db_pool)
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+            // No block satisfies block_time >= time_from: time_from is past
+            // the head. Use i64::MAX so `block_number >= MAX` matches nothing.
+            Some(row.map(|r| r.block_number).unwrap_or(i64::MAX))
+        } else {
+            None
+        };
+
+        let to = if let Some(tt) = time_to {
+            let row = sqlx::query!(
+                "SELECT block_number FROM blocks WHERE block_time <= $1 ORDER BY block_time DESC LIMIT 1",
+                tt
+            )
+            .fetch_optional(&self.db_pool)
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+            // No block satisfies block_time <= time_to: time_to is before
+            // the tail. Use -1 so `block_number <= -1` matches nothing.
+            Some(row.map(|r| r.block_number).unwrap_or(-1))
+        } else {
+            None
+        };
+
+        Ok((from, to))
+    }
+
     pub async fn get_storage_snapshots(
         &self,
         params: GetStorageSnapshotsParams,
@@ -2145,6 +3171,34 @@ impl AppState {
             None
         };
 
+        // Convert the time range to a block_number range so the partial
+        // expression indexes (keyed on (storage_keys->>0, block_number DESC))
+        // can satisfy the window in a single Index Scan; intersect with any
+        // explicit block_from / block_to.
+        let (time_block_from, time_block_to) = self
+            .resolve_block_bounds_from_time(time_from, time_to)
+            .await?;
+        let block_from = match (
+            params
+                .block_from
+                .map(|x| to_i64_param("block_from", x))
+                .transpose()?,
+            time_block_from,
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let block_to = match (
+            params
+                .block_to
+                .map(|x| to_i64_param("block_to", x))
+                .transpose()?,
+            time_block_to,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+
         // Resolve storage pallet name to index if needed
         let storage_pallet_idx = match &params.pallet {
             None => None,
@@ -2157,6 +3211,15 @@ impl AppState {
                 Some(*idx as u32)
             }
         };
+
+        // Validate: data filter requires pallet and storage_location for efficient index usage
+        if params.data.is_some()
+            && (storage_pallet_idx.is_none() || params.storage_location.is_none())
+        {
+            return Err(RpcError::invalid_params(
+                "data filter requires both pallet and storage_location to be specified",
+            ));
+        }
 
         // Resolve extrinsic pallet/method filters if present
         let (ext_pallet, ext_method) = if let Some(ref ext_filter) = params.extrinsic {
@@ -2199,205 +3262,155 @@ impl AppState {
 
         // Determine sort order
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(10) as i64;
+        let limit = page_limit(params.limit, 10);
         let cursor_op = if sort_order.eq_ignore_ascii_case("desc") {
             "<"
         } else {
             ">"
         };
 
+        // Canonical ASC/DESC literal for inlining into ORDER BY clauses (the
+        // raw `params.sort_order` is unvalidated user input and must not be
+        // formatted into SQL directly).
+        let sort_order_sql = if cursor_op == "<" { "DESC" } else { "ASC" };
+
         // Build the query based on whether we need epochs/sampling
         if is_sampling {
-            // Use CTE with epochs and DISTINCT ON for sampling
+            // Sampling: instead of "scan every snapshot in [block_from, block_to]
+            // for this filter, then DISTINCT ON (epoch_bucket)" — which has to
+            // read O(matching_snapshots) rows just to keep one per bucket — we
+            // pre-compute bucket boundaries from the (small) `epochs` table and
+            // pull one snapshot per bucket via a `CROSS JOIN LATERAL` that hits
+            // the partial index `(storage_keys->>0, block_number DESC)` with a
+            // `LIMIT 1`. Total rows fetched from `storage_snapshots` is
+            // O(buckets), not O(account_snapshots_in_window).
             let sample_unit = params.sample.unwrap();
             let epochs_per_sample = sample_unit.epochs_per_sample();
 
-            // If fill is requested, first get the starting epoch_bucket to constrain the range
-            let epoch_range_constraint: Option<(i64, i64)> = if params.fill {
-                // Quick query to get the first epoch_bucket using MIN/MAX
-                let agg_func = if sort_order.eq_ignore_ascii_case("desc") {
-                    "MAX"
-                } else {
-                    "MIN"
-                };
-
-                let mut first_query = QueryBuilder::<Postgres>::new(
-                    "WITH epochs_with_end AS (
-                        SELECT epoch, epoch_start,
-                               LEAD(epoch_start) OVER (ORDER BY epoch) as epoch_end,
-                               epoch_start_time
-                        FROM epochs
-                    ),
-                    snapshots_with_bucket AS (
-                        SELECT (ep.epoch / ",
-                );
-                first_query.push_bind(epochs_per_sample);
-                first_query.push(") * ");
-                first_query.push_bind(epochs_per_sample);
-                first_query.push(
-                    " as epoch_bucket
-                        FROM storage_snapshots s
-                        LEFT JOIN epochs_with_end ep ON ep.epoch_start <= s.block_number
-                            AND (ep.epoch_end IS NULL OR ep.epoch_end > s.block_number)",
-                );
-
-                // Join with extrinsics if we have extrinsic filters
-                if has_extrinsic_filter {
-                    first_query.push(" INNER JOIN extrinsics e ON s.block_number = e.block_number AND s.extrinsic_index = e.index");
-                }
-
-                // Join with events if we have event filters
-                if has_event_filter {
-                    first_query.push(" INNER JOIN events ev ON s.block_number = ev.block_number AND s.extrinsic_index = ev.extrinsic_index AND s.event_index = ev.index");
-                }
-
-                // Build WHERE clause
-                self.build_storage_snapshot_where_clause(
-                    &mut first_query,
-                    &params,
-                    storage_pallet_idx,
-                    time_from,
-                    time_to,
-                    ext_pallet,
-                    ext_method,
-                    ext_account_id,
-                    evt_pallet,
-                    evt_variant,
-                    None,
-                    cursor_op,
-                );
-
-                // Add epoch_bucket NOT NULL filter
-                first_query.push(" AND (ep.epoch / ");
-                first_query.push_bind(epochs_per_sample);
-                first_query.push(") * ");
-                first_query.push_bind(epochs_per_sample);
-                first_query.push(" IS NOT NULL");
-
-                if let Some(cursor) = params.cursor {
-                    first_query.push(format!(" AND (ep.epoch / "));
-                    first_query.push_bind(epochs_per_sample);
-                    first_query.push(") * ");
-                    first_query.push_bind(epochs_per_sample);
-                    first_query.push(format!(" {} ", cursor_op));
-                    first_query.push_bind(cursor);
-                }
-
-                // Close the CTE and select MIN or MAX
-                first_query.push(format!(
-                    ")
-                    SELECT {}(epoch_bucket) as epoch_bucket FROM snapshots_with_bucket",
-                    agg_func
-                ));
-
-                #[derive(sqlx::FromRow)]
-                struct EpochBucketRow {
-                    epoch_bucket: Option<i64>,
-                }
-
-                let first_result: Option<EpochBucketRow> = first_query
-                    .build_query_as()
-                    .fetch_optional(&self.db_pool)
-                    .await
-                    .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
-
-                first_result
-                    .and_then(|r| r.epoch_bucket)
-                    .map(|first_bucket| {
-                        // Calculate the range that gives at most `limit` items after filling
-                        let range = (limit - 1) * epochs_per_sample;
-                        if sort_order.eq_ignore_ascii_case("desc") {
-                            // DESC: from first_bucket down to first_bucket - range
-                            (first_bucket - range, first_bucket)
-                        } else {
-                            // ASC: from first_bucket up to first_bucket + range
-                            (first_bucket, first_bucket + range)
-                        }
-                    })
+            let bucket_cursor = if let Some(cursor_value) = &params.cursor {
+                Some(cursor_value.as_i64().ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "cursor for `sample` queries must be a number (epoch_bucket)",
+                    )
+                })?)
             } else {
                 None
             };
 
-            let mut query_builder = QueryBuilder::<Postgres>::new(
+            // Bucket pre-computation: group epochs by `(epoch / N) * N` and
+            // record the [bucket_start_block, bucket_end_block) range. Use a
+            // sentinel bigint MAX for the open-ended last epoch so the LATERAL
+            // upper bound stays well-defined.
+            let mut query_builder = QueryBuilder::<Postgres>::new(format!(
                 "WITH epochs_with_end AS (
                     SELECT epoch, epoch_start,
-                           LEAD(epoch_start) OVER (ORDER BY epoch) as epoch_end,
+                           LEAD(epoch_start) OVER (ORDER BY epoch) AS epoch_end_block,
                            epoch_start_time
                     FROM epochs
                 ),
-                snapshots_with_epoch AS (
+                buckets AS (
+                    SELECT (epoch / {n}) * {n} AS epoch_bucket,
+                           MIN(epoch_start) AS bucket_start_block,
+                           MAX(COALESCE(epoch_end_block, 9223372036854775807)) AS bucket_end_block
+                    FROM epochs_with_end",
+                n = epochs_per_sample
+            ));
+
+            // Restrict the bucket pool to epochs whose block range intersects
+            // the user's [block_from, block_to]. Cheap (epochs is small) and
+            // avoids GROUP BY on the entire history.
+            let mut bucket_where_started = false;
+            if let Some(bt) = block_to {
+                query_builder.push(" WHERE TRUE");
+                bucket_where_started = true;
+                query_builder.push(" AND epoch_start <= ").push_bind(bt);
+            }
+            if let Some(bf) = block_from {
+                if !bucket_where_started {
+                    query_builder.push(" WHERE TRUE");
+                    bucket_where_started = true;
+                }
+                query_builder
+                    .push(" AND (epoch_end_block IS NULL OR epoch_end_block > ")
+                    .push_bind(bf)
+                    .push(")");
+            }
+            let _ = bucket_where_started;
+
+            query_builder.push(format!(
+                " GROUP BY (epoch / {n}) * {n}",
+                n = epochs_per_sample
+            ));
+
+            if let Some(cursor) = bucket_cursor {
+                query_builder.push(format!(
+                    " HAVING (epoch / {n}) * {n} {} ",
+                    cursor_op,
+                    n = epochs_per_sample
+                ));
+                query_builder.push_bind(cursor);
+            }
+
+            // Limit at the bucket level so the LATERAL only fires for buckets
+            // we actually need. limit+1 lets us detect has_more.
+            query_builder.push(format!(" ORDER BY epoch_bucket {} LIMIT ", sort_order_sql));
+            query_builder.push_bind(limit + 1);
+
+            // Outer SELECT: one row per (kept) bucket, with the LATERAL-picked
+            // snapshot inlined. `LEFT JOIN epochs_with_end` re-attaches the
+            // epoch info for the chosen snapshot so the response shape matches
+            // the non-LATERAL branch.
+            query_builder.push(
+                ")
+                SELECT s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
+                       s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
+                       s.epoch_end,
+                       ep.epoch, ep.epoch_start, ep.epoch_end_block, ep.epoch_start_time
+                FROM buckets b
+                CROSS JOIN LATERAL (
                     SELECT s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
                            s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
-                           ep.epoch, ep.epoch_start, ep.epoch_end, ep.epoch_start_time,
-                           (ep.epoch / ",
-            );
-            query_builder.push_bind(epochs_per_sample);
-            query_builder.push(") * ");
-            query_builder.push_bind(epochs_per_sample);
-            query_builder.push(
-                " as epoch_bucket
-                    FROM storage_snapshots s
-                    LEFT JOIN epochs_with_end ep ON ep.epoch_start <= s.block_number
-                        AND (ep.epoch_end IS NULL OR ep.epoch_end > s.block_number)",
+                           s.epoch_end
+                    FROM storage_snapshots s",
             );
 
-            // Join with extrinsics if we have extrinsic filters
             if has_extrinsic_filter {
                 query_builder.push(" INNER JOIN extrinsics e ON s.block_number = e.block_number AND s.extrinsic_index = e.index");
             }
-
-            // Join with events if we have event filters
             if has_event_filter {
                 query_builder.push(" INNER JOIN events ev ON s.block_number = ev.block_number AND s.extrinsic_index = ev.extrinsic_index AND s.event_index = ev.index");
             }
 
-            // Build WHERE clause for inner query
-            self.build_storage_snapshot_where_clause(
+            // Per-bucket bounds are mandatory; user filters are appended.
+            // Passing `block_from`/`block_to` here is fine — they intersect with
+            // the per-bucket bounds (the planner uses whichever is tighter).
+            query_builder.push(
+                " WHERE s.block_number >= b.bucket_start_block AND s.block_number < b.bucket_end_block",
+            );
+            self.append_storage_snapshot_conditions(
                 &mut query_builder,
                 &params,
                 storage_pallet_idx,
-                time_from,
-                time_to,
+                block_from,
+                block_to,
                 ext_pallet,
                 ext_method,
                 ext_account_id,
                 evt_pallet,
                 evt_variant,
-                None, // No cursor on inner query for sampling
+                None, // bucket-level cursor handled at the buckets CTE above
                 cursor_op,
-            );
+            )?;
 
+            // Top-1 within the bucket. The partial index serves this directly:
+            // (storage_keys->>0 = $1, block_number DESC) → first index entry
+            // is the row we want.
             query_builder.push(
-                ")
-                SELECT DISTINCT ON (epoch_bucket)
-                    id, block_number, extrinsic_index, event_index, block_time,
-                    pallet, storage_location, storage_keys, data, config_rule,
-                    epoch, epoch_start, epoch_end, epoch_start_time, epoch_bucket
-                FROM snapshots_with_epoch
-                WHERE epoch_bucket IS NOT NULL",
+                " ORDER BY s.block_number DESC LIMIT 1) s
+                LEFT JOIN epochs_with_end ep ON ep.epoch_start <= s.block_number
+                    AND (ep.epoch_end_block IS NULL OR ep.epoch_end_block > s.block_number)",
             );
-
-            // Apply epoch range constraint if fill is requested
-            if let Some((min_bucket, max_bucket)) = epoch_range_constraint {
-                query_builder.push(" AND epoch_bucket >= ");
-                query_builder.push_bind(min_bucket);
-                query_builder.push(" AND epoch_bucket <= ");
-                query_builder.push_bind(max_bucket);
-            } else if let Some(cursor) = params.cursor {
-                // Cursor for sampling is based on epoch_bucket (only if no range constraint)
-                query_builder.push(format!(" AND epoch_bucket {} ", cursor_op));
-                query_builder.push_bind(cursor);
-            }
-
-            query_builder.push(format!(
-                " ORDER BY epoch_bucket {}, block_number DESC",
-                sort_order
-            ));
-
-            // When fill is used with range constraint, we don't need limit+1 check
-            if epoch_range_constraint.is_none() {
-                query_builder.push(" LIMIT ").push_bind(limit + 1);
-            }
+            query_builder.push(format!(" ORDER BY b.epoch_bucket {}", sort_order_sql));
 
             let query = query_builder.build_query_as::<StorageSnapshotDbRow>();
             let db_rows: Vec<StorageSnapshotDbRow> =
@@ -2405,27 +3418,16 @@ impl AppState {
                     .await
                     .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
 
-            // Apply fill if requested
-            let filled_rows = if params.fill {
-                self.fill_missing_epochs(db_rows, epochs_per_sample)
-            } else {
-                db_rows
-            };
-
-            // Check pagination
-            let has_more = if epoch_range_constraint.is_some() {
-                // With fill + range constraint, check if we got exactly limit items
-                // (meaning there could be more beyond the range)
-                filled_rows.len() >= limit as usize
-            } else {
-                filled_rows.len() > limit as usize
-            };
-
+            // The buckets CTE LIMITs at limit+1, so >limit non-empty rows
+            // means more buckets follow. Empty buckets (no snapshot match the
+            // filters in that range) are dropped by CROSS JOIN LATERAL — in
+            // that edge case has_more is conservatively false, but the cursor
+            // still advances past the last returned bucket so pagination
+            // remains consistent.
+            let has_more = db_rows.len() > limit as usize;
             let mut items: Vec<StorageSnapshotRow> =
-                filled_rows.into_iter().map(|r| r.into()).collect();
-
-            if has_more && epoch_range_constraint.is_none() {
-                // Only pop if not using range constraint
+                db_rows.into_iter().map(|r| r.into()).collect();
+            if has_more {
                 items.pop();
             }
 
@@ -2442,52 +3444,78 @@ impl AppState {
                 unfiltered_count: None,
             })
         } else if needs_epochs {
-            // Include epochs but no sampling
+            // Include epochs but no sampling.
+            //
+            // Same dedup approach as the simple branch below — DISTINCT ON inside a
+            // subquery with id direction opposite to user sort_order, then JOIN
+            // epochs_with_end on the deduped result.
+            let inner_id_dir = if sort_order.eq_ignore_ascii_case("desc") {
+                "ASC"
+            } else {
+                "DESC"
+            };
             let mut query_builder = QueryBuilder::<Postgres>::new(
                 "WITH epochs_with_end AS (
                     SELECT epoch, epoch_start,
-                           LEAD(epoch_start) OVER (ORDER BY epoch) as epoch_end,
+                           LEAD(epoch_start) OVER (ORDER BY epoch) as epoch_end_block,
                            epoch_start_time
                     FROM epochs
                 )
-                SELECT s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
-                       s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
-                       ep.epoch, ep.epoch_start, ep.epoch_end, ep.epoch_start_time,
-                       NULL::bigint as epoch_bucket
-                FROM storage_snapshots s
-                LEFT JOIN epochs_with_end ep ON ep.epoch_start <= s.block_number
-                    AND (ep.epoch_end IS NULL OR ep.epoch_end > s.block_number)",
+                SELECT d.id, d.block_number, d.extrinsic_index, d.event_index, d.block_time,
+                       d.pallet, d.storage_location, d.storage_keys, d.data, d.config_rule,
+                       d.epoch_end,
+                       ep.epoch, ep.epoch_start, ep.epoch_end_block, ep.epoch_start_time
+                FROM (
+                    SELECT DISTINCT ON (s.block_number, s.pallet, s.storage_location, s.storage_keys)
+                           s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
+                           s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
+                           s.epoch_end
+                    FROM storage_snapshots s",
             );
 
-            // Join with extrinsics if we have extrinsic filters
+            // Join with extrinsics if we have extrinsic filters (inside dedup subquery)
             if has_extrinsic_filter {
                 query_builder.push(" INNER JOIN extrinsics e ON s.block_number = e.block_number AND s.extrinsic_index = e.index");
             }
 
-            // Join with events if we have event filters
+            // Join with events if we have event filters (inside dedup subquery)
             if has_event_filter {
                 query_builder.push(" INNER JOIN events ev ON s.block_number = ev.block_number AND s.extrinsic_index = ev.extrinsic_index AND s.event_index = ev.index");
             }
 
-            // Build WHERE clause
+            let compound_cursor = match &params.cursor {
+                Some(c) => Some(parse_snapshot_cursor(c)?),
+                None => None,
+            };
+
+            // Build WHERE clause (inside dedup subquery)
             self.build_storage_snapshot_where_clause(
                 &mut query_builder,
                 &params,
                 storage_pallet_idx,
-                time_from,
-                time_to,
+                block_from,
+                block_to,
                 ext_pallet,
                 ext_method,
                 ext_account_id,
                 evt_pallet,
                 evt_variant,
-                params.cursor,
+                compound_cursor,
                 cursor_op,
-            );
+            )?;
 
+            // Close dedup subquery, then LEFT JOIN epoch info on the deduped rows.
+            // Inner ORDER BY leads with (pallet, storage_location, storage_keys,
+            // block_number DESC, id) to match storage_snapshots_pallet_loc_keys_block_id_idx,
+            // letting the planner skip the Sort node in front of the Unique.
+            // DISTINCT ON keys are unchanged; only the ordering of equality-grouped
+            // columns is permuted, which doesn't affect semantics.
             query_builder.push(format!(
-                " ORDER BY s.block_number {}, s.id {}",
-                sort_order, sort_order
+                " ORDER BY s.pallet, s.storage_location, s.storage_keys, s.block_number DESC, s.id {}) d
+                 LEFT JOIN epochs_with_end ep ON ep.epoch_start <= d.block_number
+                     AND (ep.epoch_end_block IS NULL OR ep.epoch_end_block > d.block_number)
+                 ORDER BY d.block_number {}, d.id {}",
+                inner_id_dir, sort_order_sql, sort_order_sql
             ));
             query_builder.push(" LIMIT ").push_bind(limit + 1);
 
@@ -2506,7 +3534,9 @@ impl AppState {
 
             Ok(Page {
                 cursor: if has_more {
-                    items.last().map(|l| serde_json::json!(l.id))
+                    items
+                        .last()
+                        .map(|l| serde_json::json!({"block_number": l.block_number, "id": l.id}))
                 } else {
                     None
                 },
@@ -2514,14 +3544,33 @@ impl AppState {
                 unfiltered_count: None,
             })
         } else {
-            // Simple query without epochs
+            // Simple query without epochs.
+            //
+            // Storage_snapshots can hold multiple rows for the same
+            // (block_number, pallet, storage_location, storage_keys) when they differ
+            // only in epoch_index (the UNIQUE constraint includes epoch_index).
+            // We dedup at the query level via DISTINCT ON. The inner ORDER BY's
+            // direction on `s.id` is the *opposite* of the user's sort_order so the
+            // chosen row's id sits at the page boundary — that lets the existing
+            // tuple-compare cursor `(s.block_number, s.id) <op> (...)` correctly
+            // exclude same-group rows on subsequent pages.
+            let inner_id_dir = if sort_order.eq_ignore_ascii_case("desc") {
+                "ASC"
+            } else {
+                "DESC"
+            };
             let mut query_builder = QueryBuilder::<Postgres>::new(
-                "SELECT s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
-                        s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
+                "SELECT d.id, d.block_number, d.extrinsic_index, d.event_index, d.block_time,
+                        d.pallet, d.storage_location, d.storage_keys, d.data, d.config_rule,
+                        d.epoch_end,
                         NULL::bigint as epoch, NULL::bigint as epoch_start,
-                        NULL::bigint as epoch_end, NULL::timestamptz as epoch_start_time,
-                        NULL::bigint as epoch_bucket
-                 FROM storage_snapshots s",
+                        NULL::bigint as epoch_end_block, NULL::timestamptz as epoch_start_time
+                 FROM (
+                     SELECT DISTINCT ON (s.block_number, s.pallet, s.storage_location, s.storage_keys)
+                            s.id, s.block_number, s.extrinsic_index, s.event_index, s.block_time,
+                            s.pallet, s.storage_location, s.storage_keys, s.data, s.config_rule,
+                            s.epoch_end
+                     FROM storage_snapshots s",
             );
 
             // Join with extrinsics if we have extrinsic filters
@@ -2534,25 +3583,37 @@ impl AppState {
                 query_builder.push(" INNER JOIN events ev ON s.block_number = ev.block_number AND s.extrinsic_index = ev.extrinsic_index AND s.event_index = ev.index");
             }
 
-            // Build WHERE clause
+            let compound_cursor = match &params.cursor {
+                Some(c) => Some(parse_snapshot_cursor(c)?),
+                None => None,
+            };
+
+            // Build WHERE clause (applied inside the dedup subquery)
             self.build_storage_snapshot_where_clause(
                 &mut query_builder,
                 &params,
                 storage_pallet_idx,
-                time_from,
-                time_to,
+                block_from,
+                block_to,
                 ext_pallet,
                 ext_method,
                 ext_account_id,
                 evt_pallet,
                 evt_variant,
-                params.cursor,
+                compound_cursor,
                 cursor_op,
-            );
+            )?;
 
+            // Inner ORDER BY leads with (pallet, storage_location, storage_keys,
+            // block_number DESC, id) to match storage_snapshots_pallet_loc_keys_block_id_idx,
+            // letting the planner skip the Sort node in front of the Unique.
+            // DISTINCT ON keys are unchanged; only the ordering of equality-grouped
+            // columns is permuted, which doesn't affect semantics. Trailing s.id <dir>
+            // chooses MIN id (desc sort) or MAX id (asc sort) per group.
             query_builder.push(format!(
-                " ORDER BY s.block_number {}, s.id {}",
-                sort_order, sort_order
+                " ORDER BY s.pallet, s.storage_location, s.storage_keys, s.block_number DESC, s.id {}) AS d
+                 ORDER BY d.block_number {}, d.id {}",
+                inner_id_dir, sort_order_sql, sort_order_sql
             ));
             query_builder.push(" LIMIT ").push_bind(limit + 1);
 
@@ -2571,7 +3632,9 @@ impl AppState {
 
             Ok(Page {
                 cursor: if has_more {
-                    items.last().map(|l| serde_json::json!(l.id))
+                    items
+                        .last()
+                        .map(|l| serde_json::json!({"block_number": l.block_number, "id": l.id}))
                 } else {
                     None
                 },
@@ -2588,171 +3651,196 @@ impl AppState {
         query_builder: &mut QueryBuilder<'a, Postgres>,
         params: &'a GetStorageSnapshotsParams,
         storage_pallet_idx: Option<u32>,
-        time_from: Option<DateTime<Utc>>,
-        time_to: Option<DateTime<Utc>>,
+        block_from: Option<i64>,
+        block_to: Option<i64>,
         ext_pallet: Option<u32>,
         ext_method: Option<u32>,
-        ext_account_id: Option<&String>,
+        ext_account_id: Option<&'a String>,
         evt_pallet: Option<u32>,
         evt_variant: Option<u32>,
-        cursor: Option<i64>,
+        cursor: Option<(i64, i64)>,
         cursor_op: &str,
-    ) {
+    ) -> RpcResult<()> {
         let has_extrinsic_filter =
             ext_pallet.is_some() || ext_method.is_some() || ext_account_id.is_some();
         let has_event_filter = evt_pallet.is_some() || evt_variant.is_some();
 
         let has_conditions = cursor.is_some()
-            || params.block_from.is_some()
-            || params.block_to.is_some()
-            || time_from.is_some()
-            || time_to.is_some()
+            || block_from.is_some()
+            || block_to.is_some()
             || storage_pallet_idx.is_some()
             || params.storage_location.is_some()
             || params.storage_keys.is_some()
             || params.data.is_some()
             || params.config_rule.is_some()
+            || params.epoch_index.is_some()
+            || params.epoch_end.is_some()
             || has_extrinsic_filter
             || has_event_filter
             || params.exclude_deleted;
 
         if has_conditions {
-            query_builder.push(" WHERE ");
-            let mut conditions = query_builder.separated(" AND ");
-
-            if let Some(cursor) = cursor {
-                conditions
-                    .push(format!("s.id {} ", cursor_op))
-                    .push_bind_unseparated(cursor);
-            }
-            if let Some(block_from) = params.block_from {
-                conditions
-                    .push("s.block_number >= ")
-                    .push_bind_unseparated(block_from as i64);
-            }
-            if let Some(block_to) = params.block_to {
-                conditions
-                    .push("s.block_number <= ")
-                    .push_bind_unseparated(block_to as i64);
-            }
-            if let Some(time_from) = time_from {
-                conditions
-                    .push("s.block_time >= ")
-                    .push_bind_unseparated(time_from);
-            }
-            if let Some(time_to) = time_to {
-                conditions
-                    .push("s.block_time <= ")
-                    .push_bind_unseparated(time_to);
-            }
-            if let Some(pallet) = storage_pallet_idx {
-                conditions
-                    .push("s.pallet = ")
-                    .push_bind_unseparated(pallet as i32);
-            }
-            if let Some(storage_location) = &params.storage_location {
-                conditions
-                    .push("s.storage_location = ")
-                    .push_bind_unseparated(storage_location);
-            }
-            if let Some(storage_keys) = &params.storage_keys {
-                conditions
-                    .push("s.storage_keys @> ")
-                    .push_bind_unseparated(storage_keys);
-            }
-            if let Some(data) = &params.data {
-                conditions.push("s.data @> ").push_bind_unseparated(data);
-            }
-            if let Some(config_rule) = &params.config_rule {
-                conditions
-                    .push("s.config_rule = ")
-                    .push_bind_unseparated(config_rule);
-            }
-            if let Some(pallet) = ext_pallet {
-                conditions
-                    .push("e.pallet = ")
-                    .push_bind_unseparated(pallet as i32);
-            }
-            if let Some(method) = ext_method {
-                conditions
-                    .push("e.method = ")
-                    .push_bind_unseparated(method as i32);
-            }
-            if let Some(account_id) = ext_account_id {
-                conditions
-                    .push("e.account_id = ")
-                    .push_bind_unseparated(normalize_address(account_id));
-            }
-            if let Some(pallet) = evt_pallet {
-                conditions
-                    .push("ev.pallet = ")
-                    .push_bind_unseparated(pallet as i32);
-            }
-            if let Some(variant) = evt_variant {
-                conditions
-                    .push("ev.variant = ")
-                    .push_bind_unseparated(variant as i32);
-            }
-            if params.exclude_deleted {
-                conditions.push(
-                    "NOT EXISTS (
-                        SELECT 1 FROM storage_snapshots s2
-                        WHERE s2.pallet = s.pallet
-                        AND s2.storage_location = s.storage_location
-                        AND s2.storage_keys = s.storage_keys
-                        AND s2.block_number > s.block_number
-                        AND s2.data = 'null'::jsonb
-                    )",
-                );
-            }
+            // Emit `WHERE TRUE` then have the helper append each condition
+            // prefixed with ` AND `. The trailing `TRUE AND ...` is folded by
+            // the planner. Sharing the helper with the LATERAL sampling branch
+            // (which prefixes its own `WHERE <bucket bounds>`) avoids
+            // duplicating ~150 lines of filter logic.
+            query_builder.push(" WHERE TRUE");
+            self.append_storage_snapshot_conditions(
+                query_builder,
+                params,
+                storage_pallet_idx,
+                block_from,
+                block_to,
+                ext_pallet,
+                ext_method,
+                ext_account_id,
+                evt_pallet,
+                evt_variant,
+                cursor,
+                cursor_op,
+            )?;
         }
+        Ok(())
     }
 
-    /// Fill missing epoch buckets with the previous value
-    fn fill_missing_epochs(
+    /// Append every active storage-snapshot filter to `query_builder` as
+    /// ` AND <condition>`. The caller is responsible for emitting the leading
+    /// `WHERE` (and any caller-specific conditions before this) so the helper
+    /// can be used both standalone and inside a LATERAL whose WHERE already
+    /// has per-bucket bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn append_storage_snapshot_conditions<'a>(
         &self,
-        rows: Vec<StorageSnapshotDbRow>,
-        epochs_per_sample: i64,
-    ) -> Vec<StorageSnapshotDbRow> {
-        if rows.len() < 2 {
-            return rows;
+        qb: &mut QueryBuilder<'a, Postgres>,
+        params: &'a GetStorageSnapshotsParams,
+        storage_pallet_idx: Option<u32>,
+        block_from: Option<i64>,
+        block_to: Option<i64>,
+        ext_pallet: Option<u32>,
+        ext_method: Option<u32>,
+        ext_account_id: Option<&'a String>,
+        evt_pallet: Option<u32>,
+        evt_variant: Option<u32>,
+        cursor: Option<(i64, i64)>,
+        cursor_op: &str,
+    ) -> RpcResult<()> {
+        if let Some((cursor_block, cursor_id)) = cursor {
+            qb.push(format!(" AND (s.block_number, s.id) {} (", cursor_op))
+                .push_bind(cursor_block)
+                .push(", ")
+                .push_bind(cursor_id)
+                .push(")");
         }
-
-        let mut result: Vec<StorageSnapshotDbRow> = Vec::new();
-        let mut last_value: Option<StorageSnapshotDbRow> = None;
-
-        // Get min and max buckets
-        let min_bucket = rows.iter().filter_map(|r| r.epoch_bucket).min();
-        let max_bucket = rows.iter().filter_map(|r| r.epoch_bucket).max();
-
-        if let (Some(min), Some(max)) = (min_bucket, max_bucket) {
-            // Build a map of bucket -> row
-            let bucket_map: std::collections::HashMap<i64, &StorageSnapshotDbRow> = rows
-                .iter()
-                .filter_map(|r| r.epoch_bucket.map(|b| (b, r)))
-                .collect();
-
-            let mut bucket = min;
-            while bucket <= max {
-                if let Some(row) = bucket_map.get(&bucket) {
-                    result.push((*row).clone());
-                    last_value = Some((*row).clone());
-                } else if let Some(ref prev) = last_value {
-                    // Fill with previous value
-                    let mut filled = prev.clone();
-                    filled.id = -bucket; // Negative ID indicates filled value
-                    filled.epoch_bucket = Some(bucket);
-                    // Update epoch to match the bucket
-                    filled.epoch = Some(bucket);
-                    result.push(filled);
-                }
-                bucket += epochs_per_sample;
+        if let Some(block_from) = block_from {
+            qb.push(" AND s.block_number >= ").push_bind(block_from);
+        }
+        if let Some(block_to) = block_to {
+            qb.push(" AND s.block_number <= ").push_bind(block_to);
+        }
+        // Inline `pallet` and `storage_location` as SQL literals (rather than
+        // bind parameters) so the planner can match the partial expression
+        // indexes such as `storage_snapshots_system_account_key_idx`, whose
+        // predicate is `WHERE pallet = N AND storage_location = '<name>'`.
+        // Under sqlx's prepared statements PG flips to a generic plan after
+        // ~5 executions; a generic plan cannot prove that a bound parameter
+        // equals the index's literal, so the partial index is not used and
+        // the query falls back to a wide bitmap scan.
+        if let Some(pallet) = storage_pallet_idx {
+            qb.push(format!(" AND s.pallet = {}", pallet as i32));
+        }
+        if let Some(storage_location) = &params.storage_location {
+            if !is_valid_storage_location(storage_location) {
+                return Err(RpcError::invalid_params(format!(
+                    "invalid storage_location: {}",
+                    storage_location
+                )));
             }
-        } else {
-            return rows;
+            qb.push(format!(" AND s.storage_location = '{}'", storage_location));
         }
+        if let Some(storage_keys) = &params.storage_keys {
+            // Positional filter: each array position maps to a storage_keys->>N
+            // equality (or storage_keys->N->>0 for nested keys). Null positions
+            // are skipped. This always matches the expression indexes on
+            // storage_keys when pallet+storage_location are specified.
+            let arr = storage_keys.as_array().ok_or_else(|| {
+                RpcError::invalid_params(
+                    "storage_keys must be a JSON array (e.g. [\"x\"] or [null, \"y\"] or [[\"nested\"]])",
+                )
+            })?;
 
-        result
+            for (idx, element) in arr.iter().enumerate() {
+                if element.is_null() {
+                    continue;
+                }
+
+                if let Some(text) = primitive_as_text(element) {
+                    qb.push(format!(" AND s.storage_keys->>{} = ", idx))
+                        .push_bind(text);
+                    continue;
+                }
+
+                if let Some(inner) = element.as_array() {
+                    if inner.len() == 1 {
+                        if let Some(text) = primitive_as_text(&inner[0]) {
+                            qb.push(format!(" AND s.storage_keys->{}->>0 = ", idx))
+                                .push_bind(text);
+                            continue;
+                        }
+                    }
+                    return Err(RpcError::invalid_params(format!(
+                        "storage_keys[{}]: nested key must be a single-element array of string|number|bool",
+                        idx
+                    )));
+                }
+
+                return Err(RpcError::invalid_params(format!(
+                    "storage_keys[{}]: must be null, a primitive (string|number|bool), or a single-element nested array",
+                    idx
+                )));
+            }
+        }
+        if let Some(data) = &params.data {
+            qb.push(" AND s.data @> ").push_bind(data);
+        }
+        if let Some(config_rule) = &params.config_rule {
+            qb.push(" AND s.config_rule = ").push_bind(config_rule);
+        }
+        if let Some(epoch_index) = params.epoch_index {
+            qb.push(" AND s.epoch_index = ").push_bind(epoch_index);
+        }
+        if let Some(epoch_end) = params.epoch_end {
+            qb.push(" AND s.epoch_end = ").push_bind(epoch_end);
+        }
+        if let Some(pallet) = ext_pallet {
+            qb.push(format!(" AND e.pallet = {}", pallet as i32));
+        }
+        if let Some(method) = ext_method {
+            qb.push(format!(" AND e.method = {}", method as i32));
+        }
+        if let Some(account_id) = ext_account_id {
+            qb.push(" AND e.account_id = ")
+                .push_bind(normalize_address(account_id));
+        }
+        if let Some(pallet) = evt_pallet {
+            qb.push(format!(" AND ev.pallet = {}", pallet as i32));
+        }
+        if let Some(variant) = evt_variant {
+            qb.push(format!(" AND ev.variant = {}", variant as i32));
+        }
+        if params.exclude_deleted {
+            qb.push(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM storage_snapshots s2
+                    WHERE s2.pallet = s.pallet
+                    AND s2.storage_location = s.storage_location
+                    AND s2.storage_keys = s.storage_keys
+                    AND s2.block_number > s.block_number
+                    AND s2.data = 'null'::jsonb
+                )",
+            );
+        }
+        Ok(())
     }
 
     /// Get epoch metrics for a manager.
@@ -2763,7 +3851,7 @@ impl AppState {
     ) -> RpcResult<Page<EpochMetricsItem>> {
         use crate::entities::EpochIndexPhase;
 
-        let limit = params.limit.unwrap_or(16) as i64;
+        let limit = page_limit(params.limit, 16);
 
         trace!(
             "get_metrics_by_manager called with manager={}, epoch_from={:?}, epoch_to={:?}, limit={}, cursor={:?}",
@@ -2866,7 +3954,7 @@ impl AppState {
     ) -> RpcResult<Page<EpochMetricsManagerItem>> {
         use crate::entities::EpochIndexPhase;
 
-        let limit = params.limit.unwrap_or(16) as i64;
+        let limit = page_limit(params.limit, 16);
 
         let processor = normalize_address_with_prefix(&params.processor);
         trace!(
@@ -2987,7 +4075,7 @@ impl AppState {
     ) -> RpcResult<Page<CommitmentRow>> {
         let order_by = params.order_by.as_deref().unwrap_or("stake_amount");
         let sort_order = params.sort_order.as_deref().unwrap_or("desc");
-        let limit = params.limit.unwrap_or(50) as i64;
+        let limit = page_limit(params.limit, 50);
 
         // Validate order_by column
         let valid_columns = [
@@ -3333,10 +4421,7 @@ impl AppState {
                             .as_ref()
                             .map(|v| serde_json::json!(v.to_string()))
                             .unwrap_or(serde_json::Value::Null),
-                        "cooldown_period" => l
-                            .cooldown_period
-                            .map(|v| serde_json::json!(v))
-                            .unwrap_or(serde_json::Value::Null),
+                        "cooldown_period" => serde_json::json!(l.cooldown_period),
                         "combined_stake" => {
                             // Computed: stake_amount + delegations_total_amount
                             let sum = &l.stake_amount + &l.delegations_total_amount;
@@ -3362,6 +4447,359 @@ impl AppState {
             unfiltered_count: estimate.map(|(e,)| e as u32),
         })
     }
+
+    pub async fn get_base_rewards(
+        &self,
+        params: GetBaseRewardsParams,
+    ) -> RpcResult<Page<BaseRewardItem>> {
+        let limit = page_limit(params.limit, 50);
+
+        if params.manager.is_empty() {
+            Err(RpcError::invalid_params("Manager cannot be empty"))?;
+        }
+        // events.data->>0 stores addresses with 0x prefix; extrinsics.account_id without.
+        let manager_address = normalize_address_with_prefix(&params.manager);
+        let processor_address = params.processor.as_deref().map(normalize_address);
+        let cursor_processor = params.cursor_processor.as_deref().map(normalize_address);
+
+        let (heartbeat_pallet, heartbeat_method) = resolve_extrinsic_pallet_method(
+            &self.client,
+            Some(&StringOrNumber::String(
+                "AcurastProcessorManager".to_string(),
+            )),
+            Some(&StringOrNumber::String(
+                "heartbeat_with_metrics".to_string(),
+            )),
+        )
+        .await?;
+        let heartbeat_pallet = heartbeat_pallet.unwrap() as i32;
+        let heartbeat_method = heartbeat_method.unwrap() as i32;
+
+        let (deposit_pallet, deposit_variant) = resolve_event_pallet_variant(
+            &self.client,
+            Some(&StringOrNumber::String("Balances".to_string())),
+            Some(&StringOrNumber::String("Deposit".to_string())),
+        )
+        .await?;
+        let deposit_pallet = deposit_pallet.unwrap() as i32;
+        let deposit_variant = deposit_variant.unwrap() as i32;
+
+        // One row per (epoch, processor): SUM of all heartbeat deposits within that epoch.
+        // A processor typically heartbeats 2-3 times per epoch; aggregating gives the true
+        // total base reward per processor per epoch.
+        // Sorted (epoch DESC, processor ASC) for stable cursor-based pagination.
+        let mut query_builder = QueryBuilder::<Postgres>::new(
+            "SELECT '0x' || ext.account_id AS processor, ep.epoch, SUM((e.data->>1)::numeric)::text AS amount
+            FROM events e
+            INNER JOIN extrinsics ext
+                ON ext.block_number = e.block_number AND ext.index = e.extrinsic_index
+            INNER JOIN LATERAL (
+                SELECT epoch FROM epochs
+                WHERE epoch_start <= e.block_number
+                ORDER BY epoch_start DESC LIMIT 1
+            ) ep ON true
+            WHERE e.pallet = ",
+        );
+        query_builder.push_bind(deposit_pallet);
+        query_builder.push(" AND e.variant = ");
+        query_builder.push_bind(deposit_variant);
+        query_builder.push(" AND ext.pallet = ");
+        query_builder.push_bind(heartbeat_pallet);
+        query_builder.push(" AND ext.method = ");
+        query_builder.push_bind(heartbeat_method);
+        query_builder.push(" AND e.data->>0 = ");
+        query_builder.push_bind(&manager_address);
+
+        if let Some(ref proc) = processor_address {
+            query_builder.push(" AND ext.account_id = ");
+            query_builder.push_bind(proc);
+        }
+        if let Some(from) = params.epoch_from {
+            query_builder.push(" AND ep.epoch >= ");
+            query_builder.push_bind(from);
+        }
+        if let Some(to) = params.epoch_to {
+            query_builder.push(" AND ep.epoch <= ");
+            query_builder.push_bind(to);
+        }
+
+        // Composite cursor: resume after (cursor_epoch, cursor_processor) in (epoch DESC, processor ASC) order.
+        if let Some(c_epoch) = params.cursor_epoch {
+            if let Some(c_proc) = cursor_processor {
+                query_builder.push(" AND (ep.epoch < ");
+                query_builder.push_bind(c_epoch);
+                query_builder.push(" OR (ep.epoch = ");
+                query_builder.push_bind(c_epoch);
+                query_builder.push(" AND ext.account_id > ");
+                query_builder.push_bind(c_proc);
+                query_builder.push("))");
+            } else {
+                query_builder.push(" AND ep.epoch <= ");
+                query_builder.push_bind(c_epoch);
+            }
+        }
+
+        query_builder.push(
+            " GROUP BY ep.epoch, ext.account_id ORDER BY ep.epoch DESC, ext.account_id ASC LIMIT ",
+        );
+        query_builder.push_bind(limit + 1);
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            processor: String,
+            epoch: i64,
+            amount: Option<String>,
+        }
+
+        let query = query_builder.build_query_as::<Row>();
+        let mut rows = with_timeout(self.query_timeout, query.fetch_all(&self.db_pool))
+            .await
+            .map_err(|e| RpcError::database(format!("Database error: {}", e)))?;
+
+        let has_more = rows.len() > limit as usize;
+        if has_more {
+            rows.pop();
+        }
+
+        let items: Vec<BaseRewardItem> = rows
+            .into_iter()
+            .map(|r| BaseRewardItem {
+                processor: r.processor,
+                epoch: r.epoch,
+                amount: r.amount.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Page {
+            cursor: if has_more {
+                items.last().map(|i| {
+                    serde_json::json!({
+                        "epoch": i.epoch,
+                        "processor": i.processor,
+                    })
+                })
+            } else {
+                None
+            },
+            items,
+            unfiltered_count: None,
+        })
+    }
+
+    /// Get deployments with optional filtering and sorting
+    pub async fn get_deployments(
+        &self,
+        params: GetDeploymentsParams,
+    ) -> RpcResult<Page<DeploymentRow>> {
+        let order_by = params.order_by.as_deref().unwrap_or("block_number");
+        let sort_order = params.sort_order.as_deref().unwrap_or("desc");
+        let limit = page_limit(params.limit, 50);
+
+        // Validate order_by column
+        let valid_columns = ["block_number", "created_block_number", "start_time"];
+        if !valid_columns.contains(&order_by) {
+            return Err(RpcError::invalid_params(format!(
+                "Invalid order_by column: {}. Valid columns: {:?}",
+                order_by, valid_columns
+            )));
+        }
+
+        // Map order_by to actual SQL column
+        let order_by_col = match order_by {
+            "start_time" => "schedule_start_time",
+            col => col,
+        };
+
+        // The related_extrinsics subquery is expensive (correlated jsonb_agg per row);
+        // only build it when the caller explicitly asks for it.
+        let include_related = params.related_extrinsics.unwrap_or(false);
+        let related_select = if include_related {
+            r#"COALESCE(
+                   (SELECT jsonb_agg(jsonb_build_object(
+                       'block_number', e.block_number,
+                       'index', e.index,
+                       'pallet', e.pallet,
+                       'method', e.method,
+                       'tx_hash', e.tx_hash,
+                       'account_id', e.account_id,
+                       'block_time', e.block_time
+                   ) ORDER BY e.block_number ASC, e.index ASC)
+                   FROM jobs j
+                   JOIN extrinsics e ON e.block_number = j.block_number AND e.index = j.extrinsic_index
+                   WHERE j.chain = d.chain
+                     AND j.address = d.address
+                     AND j.seq_id = d.seq_id),
+                   '[]'::jsonb
+               ) as related_extrinsics"#
+        } else {
+            "NULL::jsonb as related_extrinsics"
+        };
+
+        let mut query_builder = QueryBuilder::<Postgres>::new(format!(
+            r#"SELECT d.id, d.chain::TEXT, d.address, d.seq_id,
+                      d.snapshot_id, d.block_number, d.block_time,
+                      d.created_block_number, d.created_block_time,
+                      d.schedule_duration, d.schedule_start_time, d.schedule_end_time,
+                      d.schedule_interval, d.schedule_max_start_delay,
+                      d.allowed_sources, d.allow_only_verified_sources,
+                      d.memory, d.network_requests, d.storage_capacity,
+                      d.required_modules, d.slots, d.reward,
+                      d.assignment_strategy, d.planned_executions,
+                      d.script, d.min_reputation, d.processor_version, d.runtime,
+                      d.is_active,
+                      {related_select}
+               FROM deployments d
+               WHERE 1=1"#
+        ));
+
+        // Add filters
+        if let Some(ref account_id) = params.account_id {
+            let normalized = normalize_address_with_prefix(account_id);
+            query_builder.push(" AND d.address = ");
+            query_builder.push_bind(normalized);
+        }
+
+        if let Some(seq_id) = params.seq_id {
+            query_builder.push(" AND d.seq_id = ");
+            query_builder.push_bind(seq_id);
+        }
+
+        if let Some(is_active) = params.is_active {
+            query_builder.push(" AND d.is_active = ");
+            query_builder.push_bind(is_active);
+        }
+
+        if let Some(block_from) = params.block_from {
+            query_builder.push(" AND d.block_number >= ");
+            query_builder.push_bind(to_i64_param("block_from", block_from)?);
+        }
+
+        if let Some(block_to) = params.block_to {
+            query_builder.push(" AND d.block_number <= ");
+            query_builder.push_bind(to_i64_param("block_to", block_to)?);
+        }
+
+        if let Some(ref exclude_addresses) = params.exclude_addresses {
+            let normalized: Vec<String> = exclude_addresses
+                .iter()
+                .map(|a| normalize_address_with_prefix(a))
+                .collect();
+            if !normalized.is_empty() {
+                query_builder.push(" AND d.address <> ALL(");
+                query_builder.push_bind(normalized);
+                query_builder.push(")");
+            }
+        }
+
+        // Add cursor condition for keyset pagination
+        let is_desc = sort_order.eq_ignore_ascii_case("desc");
+        if let Some(ref cursor) = params.cursor {
+            // Compound cursor: {seq_id: ..., val: sort_column_value}
+            let cursor_seq_id = cursor
+                .get("seq_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "Invalid cursor: expected {\"seq_id\": number, \"val\": value}",
+                    )
+                })?;
+            let cursor_val = cursor
+                .get("val")
+                .ok_or_else(|| RpcError::invalid_params("Invalid cursor: missing 'val' field"))?;
+            let cursor_val_i64 = cursor_val.as_i64().ok_or_else(|| {
+                RpcError::invalid_params("Invalid cursor: 'val' must be a number")
+            })?;
+
+            // Use tuple comparison for stable pagination
+            if is_desc {
+                query_builder.push(format!(" AND (d.{}, d.seq_id) < (", order_by_col));
+            } else {
+                query_builder.push(format!(" AND (d.{}, d.seq_id) > (", order_by_col));
+            }
+            query_builder.push_bind(cursor_val_i64);
+            query_builder.push(", ");
+            query_builder.push_bind(cursor_seq_id);
+            query_builder.push(")");
+        }
+
+        // ORDER BY and LIMIT
+        let direction = if is_desc { "DESC" } else { "ASC" };
+        query_builder.push(format!(
+            " ORDER BY d.{} {} NULLS LAST, d.seq_id {}",
+            order_by_col, direction, direction
+        ));
+        query_builder.push(" LIMIT ");
+        query_builder.push_bind(limit + 1);
+
+        // Execute query
+        let query = query_builder.build_query_as::<DeploymentQueryRow>();
+        let rows: Vec<DeploymentQueryRow> =
+            with_timeout(self.query_timeout, query.fetch_all(&self.db_pool))
+                .await
+                .map_err(|e| RpcError::database(e.to_string()))?;
+
+        // Determine if there's a next page
+        let has_next = rows.len() > limit as usize;
+        let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+
+        // Build cursor for next page
+        let next_cursor = if has_next && !rows.is_empty() {
+            let last = rows.last().unwrap();
+            let cursor_val = match order_by_col {
+                "schedule_start_time" => last.schedule_start_time,
+                "created_block_number" => last.created_block_number,
+                _ => last.block_number,
+            };
+            Some(serde_json::json!({
+                "seq_id": last.seq_id,
+                "val": cursor_val
+            }))
+        } else {
+            None
+        };
+
+        let items: Vec<DeploymentRow> = rows
+            .into_iter()
+            .map(|row| DeploymentRow {
+                id: row.id,
+                chain: row.chain,
+                address: row.address,
+                seq_id: row.seq_id,
+                snapshot_id: row.snapshot_id,
+                block_number: row.block_number,
+                block_time: row.block_time,
+                created_block_number: row.created_block_number,
+                created_block_time: row.created_block_time,
+                schedule_duration: row.schedule_duration,
+                schedule_start_time: row.schedule_start_time,
+                schedule_end_time: row.schedule_end_time,
+                schedule_interval: row.schedule_interval,
+                schedule_max_start_delay: row.schedule_max_start_delay,
+                allowed_sources: row.allowed_sources,
+                allow_only_verified_sources: row.allow_only_verified_sources,
+                memory: row.memory,
+                network_requests: row.network_requests,
+                storage_capacity: row.storage_capacity,
+                required_modules: row.required_modules,
+                slots: row.slots,
+                reward: row.reward,
+                assignment_strategy: row.assignment_strategy,
+                planned_executions: row.planned_executions,
+                script: row.script,
+                min_reputation: row.min_reputation,
+                processor_version: row.processor_version,
+                runtime: row.runtime,
+                is_active: row.is_active,
+                related_extrinsics: row.related_extrinsics,
+            })
+            .collect();
+
+        Ok(Page::<DeploymentRow> {
+            cursor: next_cursor,
+            items,
+            unfiltered_count: None,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3382,6 +4820,181 @@ pub struct GetProcessorsCountByEpochParams {
 pub struct ProcessorsCountByEpochRow {
     pub epoch: i64,
     pub count: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GetProcessorChurnParams {
+    /// Start of the date range (inclusive, RFC3339). Buckets overlapping the range
+    /// are returned. Defaults to the earliest indexed `block_time`.
+    #[serde(default)]
+    pub from: Option<DateTime<Utc>>,
+    /// End of the date range (inclusive, RFC3339). Defaults to the latest indexed
+    /// `block_time` (so the last bucket is the current, in-progress one).
+    #[serde(default)]
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// One fixed calendar bucket (a quarter or a year) with its active and onboarded
+/// processor counts. `bucket_end` is exclusive (`bucket_start` + 3 months / 1 year).
+#[derive(Debug, Serialize, Clone)]
+pub struct ProcessorChurnBucket {
+    pub bucket_start: DateTime<Utc>,
+    pub bucket_end: DateTime<Utc>,
+    /// Distinct processors that heartbeated during the bucket.
+    pub active: i64,
+    /// Distinct processors whose `onboard` extrinsic falls in the bucket.
+    pub onboarded: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ProcessorChurnResponse {
+    pub quarters: Vec<ProcessorChurnBucket>,
+    pub years: Vec<ProcessorChurnBucket>,
+}
+
+/// Ranking dimension for `getAccounts`. Each maps to a dedicated DESC index on
+/// `accounts` so the unfiltered top-N is served by an index walk.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TopAccountsType {
+    /// Liquid balance: `free + reserved` (index `accounts_total_idx`).
+    Total,
+    /// Whole balance incl. external locks:
+    /// `free + reserved + remaining_vesting + remaining_token_claim`
+    /// (index `accounts_total_external_idx`). Default ranking dimension.
+    #[default]
+    TotalWithLocked,
+    /// Spendable balance: generated `transferable` column
+    /// (index `accounts_transferable_idx`).
+    Transferable,
+    /// Free balance only (index `accounts_free_idx`).
+    Free,
+    /// Reserved balance only (index `accounts_reserved_idx`).
+    Reserved,
+    /// Frozen balance only (index `accounts_frozen_idx`).
+    Frozen,
+}
+
+impl TopAccountsType {
+    /// SQL expression to rank by. Fixed strings — never interpolate user input.
+    /// Each matches its index's expression verbatim so the planner uses it.
+    fn order_expr(self) -> &'static str {
+        match self {
+            TopAccountsType::Total => "(free + reserved)",
+            TopAccountsType::TotalWithLocked => {
+                "(free + reserved + remaining_vesting + remaining_token_claim)"
+            }
+            TopAccountsType::Transferable => "transferable",
+            TopAccountsType::Free => "free",
+            TopAccountsType::Reserved => "reserved",
+            TopAccountsType::Frozen => "frozen",
+        }
+    }
+}
+
+/// Filters + keyset cursor for `getAccounts`.
+#[derive(Debug, Deserialize, Default)]
+pub struct GetAccountsParams {
+    /// Ranking/sort dimension. Defaults to `total_with_locked`.
+    #[serde(default)]
+    pub sort: TopAccountsType,
+    #[serde(default)]
+    pub is_processor: Option<bool>,
+    #[serde(default)]
+    pub is_manager: Option<bool>,
+    #[serde(default)]
+    pub is_committer: Option<bool>,
+    /// Exact match against the attestation-derived classification: "Core" | "Lite" | "Unknown".
+    #[serde(default)]
+    pub processor_type: Option<String>,
+    /// Exact match against the attestation-derived classification: "iOS" | "Android" | "Unknown".
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// Exact match on account_id (hex or SS58, normalized before lookup).
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Exclude these accounts (hex and SS58 may be mixed; normalized before compare).
+    #[serde(default)]
+    pub exclude_addresses: Option<Vec<String>>,
+    /// Keyset cursor: `{"sort_value": <numeric string>, "account_id": <string>}`.
+    #[serde(default)]
+    pub cursor: Option<serde_json::Value>,
+    /// Number of rows to return. Defaults to 100, clamped to [1, 100].
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Filters for `getAccountsCount`. Mirrors the filter fields of
+/// `GetAccountsParams`; sort/cursor/limit are irrelevant to a count.
+#[derive(Debug, Deserialize, Default)]
+pub struct GetAccountsCountParams {
+    #[serde(default)]
+    pub is_processor: Option<bool>,
+    #[serde(default)]
+    pub is_manager: Option<bool>,
+    #[serde(default)]
+    pub is_committer: Option<bool>,
+    /// Exact match against the attestation-derived classification: "Core" | "Lite" | "Unknown".
+    #[serde(default)]
+    pub processor_type: Option<String>,
+    /// Exact match against the attestation-derived classification: "iOS" | "Android" | "Unknown".
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// Exact match on account_id (hex or SS58, normalized before lookup).
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Exclude these accounts (hex and SS58 may be mixed; normalized before compare).
+    #[serde(default)]
+    pub exclude_addresses: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GetEpochTotalsParams {
+    /// Minimum epoch (inclusive).
+    #[serde(default)]
+    pub epoch_from: Option<i64>,
+    /// Maximum epoch (inclusive).
+    #[serde(default)]
+    pub epoch_to: Option<i64>,
+    /// Max rows to return (most recent first). Defaults to 1000, clamped to [1, 5000].
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone, sqlx::FromRow)]
+pub struct EpochTotalsRow {
+    pub epoch: i64,
+    pub block_number: i64,
+    pub block_time: DateTime<Utc>,
+    // NUMERIC(38,0) columns cast to ::text to preserve full precision.
+    pub total_vesting: String,
+    pub total_token_claim: String,
+    pub total_self_staked: String,
+    pub total_delegated: String,
+}
+
+#[derive(Debug, Serialize, Clone, sqlx::FromRow)]
+pub struct TopAccountRow {
+    pub account_id: String,
+    // NUMERIC(38,0) columns cast to ::text in SQL to preserve full precision
+    // (a JSON number / f64 would lose it).
+    pub free: String,
+    pub reserved: String,
+    pub frozen: String,
+    pub transferable: String,
+    pub remaining_vesting: String,
+    pub remaining_token_claim: String,
+    /// The amount this row was ranked by (matches the requested `type`).
+    pub sort_value: String,
+    pub is_processor: bool,
+    pub is_manager: bool,
+    pub is_committer: bool,
+    /// Derived from the processor's `StoredAttestation`: "Core" | "Lite" | "Unknown" | null (not yet classified).
+    pub processor_type: Option<String>,
+    /// Derived from the processor's `StoredAttestation`: "iOS" | "Android" | "Unknown" | null (not yet classified).
+    pub device_type: Option<String>,
+    pub block_number: i64,
+    pub block_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3413,6 +5026,29 @@ pub struct EpochMetricsManagerItem {
     pub epoch: i64,
     pub manager_address: String,
     pub metrics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GetBaseRewardsParams {
+    pub manager: String,
+    /// Optional: filter to a single processor (SS58 or hex).
+    pub processor: Option<String>,
+    pub epoch_from: Option<i64>,
+    pub epoch_to: Option<i64>,
+    pub limit: Option<u32>,
+    /// Cursor epoch from the previous page's `cursor.epoch`.
+    pub cursor_epoch: Option<i64>,
+    /// Cursor processor from the previous page's `cursor.processor`.
+    pub cursor_processor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BaseRewardItem {
+    /// Processor address (0x-prefixed hex).
+    pub processor: String,
+    pub epoch: i64,
+    /// Total base reward for this processor in this epoch, in planck (sum of all heartbeat deposits).
+    pub amount: String,
 }
 
 // ============================================
@@ -3542,7 +5178,7 @@ pub struct CommitmentRow {
     pub last_slashing_epoch: i64,
     pub stake_created_epoch: i64,
     pub cooldown_started: Option<i64>,
-    pub cooldown_period: Option<i64>,
+    pub cooldown_period: i64,
     pub is_active: bool,
     pub max_delegation_capacity: Option<bigdecimal::BigDecimal>,
     pub min_max_weight_per_compute: Option<bigdecimal::BigDecimal>,
@@ -3559,4 +5195,128 @@ pub struct CommitmentRow {
     pub committed_metrics: Option<serde_json::Value>,
     pub metrics_epoch_sum: Option<serde_json::Value>,
     pub phase: i32,
+}
+
+// ============================================
+// DEPLOYMENTS
+// ============================================
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GetDeploymentsParams {
+    /// Filter by deployer address (hex or SS58)
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Filter by sequence ID
+    #[serde(default)]
+    pub seq_id: Option<i64>,
+    /// Filter by active status
+    #[serde(default)]
+    pub is_active: Option<bool>,
+
+    /// Block range filter - minimum
+    #[serde(default)]
+    pub block_from: Option<u32>,
+    /// Block range filter - maximum
+    #[serde(default)]
+    pub block_to: Option<u32>,
+
+    /// Exclude deployments deployed by any of these addresses (hex or SS58, may be mixed)
+    #[serde(default)]
+    pub exclude_addresses: Option<Vec<String>>,
+
+    /// Order by column: block_number, created_block_number, start_time (default: block_number)
+    #[serde(default)]
+    pub order_by: Option<String>,
+    /// Sort order: "asc" or "desc" (default: "desc")
+    #[serde(default)]
+    pub sort_order: Option<String>,
+    /// Maximum results (default: 50)
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Cursor for pagination: {"seq_id": ..., "val": ...}
+    #[serde(default)]
+    pub cursor: Option<serde_json::Value>,
+    /// If true, include related extrinsics for each deployment (default: false).
+    /// Excluded by default because it's expensive for list queries.
+    #[serde(default)]
+    pub related_extrinsics: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DeploymentRow {
+    pub id: i64,
+    pub chain: String,
+    pub address: String,
+    pub seq_id: i64,
+    pub snapshot_id: Option<i64>,
+    pub block_number: i64,
+    pub block_time: chrono::DateTime<chrono::Utc>,
+    pub created_block_number: i64,
+    pub created_block_time: chrono::DateTime<chrono::Utc>,
+
+    // Schedule
+    pub schedule_duration: i64,
+    pub schedule_start_time: i64,
+    pub schedule_end_time: i64,
+    pub schedule_interval: i64,
+    pub schedule_max_start_delay: i64,
+
+    // Specs
+    pub allowed_sources: Option<serde_json::Value>,
+    pub allow_only_verified_sources: bool,
+    pub memory: i64,
+    pub network_requests: i32,
+    pub storage_capacity: i64,
+    pub required_modules: Vec<String>,
+    pub slots: i32,
+    pub reward: bigdecimal::BigDecimal,
+    pub assignment_strategy: String,
+    pub planned_executions: Option<serde_json::Value>,
+    pub script: String,
+    pub min_reputation: Option<bigdecimal::BigDecimal>,
+    pub processor_version: Option<serde_json::Value>,
+    pub runtime: String,
+
+    // Status
+    pub is_active: bool,
+
+    // Related extrinsics (joined from jobs table)
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_extrinsics: Option<serde_json::Value>,
+}
+
+/// Intermediate row for querying deployments with related extrinsics
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DeploymentQueryRow {
+    pub id: i64,
+    pub chain: String,
+    pub address: String,
+    pub seq_id: i64,
+    pub snapshot_id: Option<i64>,
+    pub block_number: i64,
+    pub block_time: chrono::DateTime<chrono::Utc>,
+    pub created_block_number: i64,
+    pub created_block_time: chrono::DateTime<chrono::Utc>,
+    pub schedule_duration: i64,
+    pub schedule_start_time: i64,
+    pub schedule_end_time: i64,
+    pub schedule_interval: i64,
+    pub schedule_max_start_delay: i64,
+    pub allowed_sources: Option<serde_json::Value>,
+    pub allow_only_verified_sources: bool,
+    pub memory: i64,
+    pub network_requests: i32,
+    pub storage_capacity: i64,
+    pub required_modules: Vec<String>,
+    pub slots: i32,
+    pub reward: bigdecimal::BigDecimal,
+    pub assignment_strategy: String,
+    pub planned_executions: Option<serde_json::Value>,
+    pub script: String,
+    pub min_reputation: Option<bigdecimal::BigDecimal>,
+    pub processor_version: Option<serde_json::Value>,
+    pub runtime: String,
+    pub is_active: bool,
+    pub related_extrinsics: Option<serde_json::Value>,
 }

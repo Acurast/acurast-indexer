@@ -47,9 +47,10 @@ pub async fn queue_events_phase(
     };
     let mut task = TaskGuard::new(task_name, None);
 
-    // Track the min and max composite keys (block_number, extrinsic_index, index) that have been queued
-    let mut min_queued_key: Option<(i64, i32, i32)> = None;
-    let mut max_queued_key: Option<(i64, i32, i32)> = None;
+    // Track the min and max composite keys (block_number, index) that have been queued
+    // Note: index is unique per block, so extrinsic_index is not needed for key comparison
+    let mut min_queued_key: Option<(i64, i32)> = None;
+    let mut max_queued_key: Option<(i64, i32)> = None;
     let mut wait = 0u64;
 
     let max_event_phase = EventsIndexPhase::MAX;
@@ -62,33 +63,51 @@ pub async fn queue_events_phase(
     'outer: loop {
         trace!("Search for events with phase < {}", max_event_phase);
 
+        // Backpressure: if the worker channel is saturated, idle for 500ms
+        // before re-checking. Use the same `select!` as the normal pacing so
+        // cancellation is honored immediately in either case.
+        let backpressured = tx.len() > 5_000;
+        let sleep_ms = if backpressured { 500 } else { wait };
+
         tokio::select! {
             biased;
 
             _ = cancel_token.cancelled() => break 'outer,
-            _ = tokio::time::sleep(Duration::from_millis(wait)) => {},
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {},
+        }
+
+        if backpressured {
+            continue;
         }
 
         // Query all events with phases < max_event_phase (includes phase 0 for restart recovery)
         // Build query based on whether we have an upper block limit and exclusion range
+        // Note: Primary key is now (block_number, index) since index is unique per block
         let events: Vec<EventRow> = match (to_block, &min_queued_key, &max_queued_key) {
-            // Has upper limit and exclusion range
+            // Has upper limit and exclusion range - use UNION ALL for better index usage
             (Some(upper), Some(ref min_key), Some(ref max_key)) => {
                 sqlx::query_as(
-                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, error, block_time FROM events
-                     WHERE phase < $1 AND error IS NULL
-                       AND NOT ((block_number, extrinsic_index, index) >= ($2, $3, $4) AND (block_number, extrinsic_index, index) <= ($5, $6, $7))
-                       AND block_number >= $8 AND block_number < $9
-                     ORDER BY block_number DESC, extrinsic_index DESC, index DESC
-                     LIMIT 10000"
+                    "(SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
+                      WHERE phase < $1 AND error IS NULL
+                        AND (block_number, index) < ($2, $3)
+                        AND block_number >= $6 AND block_number < $7
+                      ORDER BY block_number DESC, index DESC
+                      LIMIT 2000)
+                     UNION ALL
+                     (SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
+                      WHERE phase < $1 AND error IS NULL
+                        AND (block_number, index) > ($4, $5)
+                        AND block_number >= $6 AND block_number < $7
+                      ORDER BY block_number DESC, index DESC
+                      LIMIT 2000)
+                     ORDER BY block_number DESC, index DESC
+                     LIMIT 2000"
                 )
                 .bind(max_event_phase as i32)
                 .bind(min_key.0)
                 .bind(min_key.1)
-                .bind(min_key.2)
                 .bind(max_key.0)
                 .bind(max_key.1)
-                .bind(max_key.2)
                 .bind(from_block as i64)
                 .bind(upper as i64)
                 .fetch_all(&db_pool)
@@ -102,10 +121,10 @@ pub async fn queue_events_phase(
             // Has upper limit, no exclusion range (first iteration)
             (Some(upper), None, None) => {
                 sqlx::query_as(
-                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, error, block_time FROM events
+                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
                      WHERE phase < $1 AND block_number >= $2 AND block_number < $3
-                     ORDER BY block_number DESC, extrinsic_index DESC, index DESC
-                     LIMIT 10000"
+                     ORDER BY block_number DESC, index DESC
+                     LIMIT 2000"
                 )
                 .bind(max_event_phase as i32)
                 .bind(from_block as i64)
@@ -118,23 +137,30 @@ pub async fn queue_events_phase(
                     err
                 })?
             }
-            // No upper limit, has exclusion range
+            // No upper limit, has exclusion range - use UNION ALL for better index usage
             (None, Some(ref min_key), Some(ref max_key)) => {
                 sqlx::query_as(
-                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, error, block_time FROM events
-                     WHERE phase < $1 AND error IS NULL
-                       AND NOT ((block_number, extrinsic_index, index) >= ($2, $3, $4) AND (block_number, extrinsic_index, index) <= ($5, $6, $7))
-                       AND block_number >= $8
-                     ORDER BY block_number DESC, extrinsic_index DESC, index DESC
-                     LIMIT 10000"
+                    "(SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
+                      WHERE phase < $1 AND error IS NULL
+                        AND (block_number, index) < ($2, $3)
+                        AND block_number >= $6
+                      ORDER BY block_number DESC, index DESC
+                      LIMIT 2000)
+                     UNION ALL
+                     (SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
+                      WHERE phase < $1 AND error IS NULL
+                        AND (block_number, index) > ($4, $5)
+                        AND block_number >= $6
+                      ORDER BY block_number DESC, index DESC
+                      LIMIT 2000)
+                     ORDER BY block_number DESC, index DESC
+                     LIMIT 2000"
                 )
                 .bind(max_event_phase as i32)
                 .bind(min_key.0)
                 .bind(min_key.1)
-                .bind(min_key.2)
                 .bind(max_key.0)
                 .bind(max_key.1)
-                .bind(max_key.2)
                 .bind(from_block as i64)
                 .fetch_all(&db_pool)
                 .await
@@ -147,10 +173,10 @@ pub async fn queue_events_phase(
             // No upper limit, no exclusion range (first iteration)
             (None, None, None) => {
                 sqlx::query_as(
-                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, error, block_time FROM events
+                    "SELECT block_number, extrinsic_index, index, pallet, variant, data, phase, event_phase, error, block_time FROM events
                      WHERE phase < $1 AND block_number >= $2
-                     ORDER BY block_number DESC, extrinsic_index DESC, index DESC
-                     LIMIT 10000"
+                     ORDER BY block_number DESC, index DESC
+                     LIMIT 2000"
                 )
                 .bind(max_event_phase as i32)
                 .bind(from_block as i64)
@@ -167,12 +193,9 @@ pub async fn queue_events_phase(
         };
 
         // Update the queued range with this batch
-        let first_key = events
-            .first()
-            .map(|e| (e.block_number, e.extrinsic_index, e.index));
-        let last_key = events
-            .last()
-            .map(|e| (e.block_number, e.extrinsic_index, e.index));
+        // Key is (block_number, index) since index is unique per block
+        let first_key = events.first().map(|e| (e.block_number, e.index));
+        let last_key = events.last().map(|e| (e.block_number, e.index));
 
         if let (Some(first), Some(last)) = (first_key, last_key) {
             // Update min and max: since we're ordering DESC, first is max, last is min
@@ -197,14 +220,12 @@ pub async fn queue_events_phase(
                 None => last,
             });
             debug!(
-                "Found events in phase < {:?} outside done range [{}-{}.{}, {}-{}.{}] ",
+                "Found events in phase < {:?} outside done range [{}.{}, {}.{}]",
                 max_event_phase,
                 min_queued_key.clone().unwrap().0,
                 min_queued_key.clone().unwrap().1,
-                min_queued_key.clone().unwrap().2,
                 max_queued_key.clone().unwrap().0,
-                max_queued_key.clone().unwrap().1,
-                max_queued_key.clone().unwrap().2
+                max_queued_key.clone().unwrap().1
             );
 
             // Publish queue range to task registry for monitoring (only when we have values)
@@ -212,15 +233,15 @@ pub async fn queue_events_phase(
             let max_key = max_queued_key.unwrap();
             TASK_REGISTRY.set_queue_range(
                 QueueType::Event,
-                format!("{}-{}.{}", min_key.0, min_key.1, min_key.2),
-                format!("{}-{}.{}", max_key.0, max_key.1, max_key.2),
+                format!("{}.{}", min_key.0, min_key.1),
+                format!("{}.{}", max_key.0, max_key.1),
             );
         }
 
         if events.is_empty() {
             wait = 1_000; // Short wait when caught up
         } else {
-            wait = 0;
+            wait = 1_000;
         }
 
         // queue each row
@@ -270,6 +291,12 @@ pub async fn process_event_phase(
         }
     }
 
+    // Skip job extraction for system events (no extrinsic_index)
+    // Jobs are always associated with extrinsics, so this is safe
+    let Some(extrinsic_index) = event.extrinsic_index else {
+        return Ok(true); // System events don't have jobs to extract
+    };
+
     if let Some(data_paths) = t_map.get(&(event.pallet as u32, event.variant as u32)) {
         let mut col_extrinsic_block_number: Vec<i64> = vec![];
         let mut col_extrinsic_index: Vec<i32> = vec![];
@@ -288,14 +315,14 @@ pub async fn process_event_phase(
                         col_address.push(address);
                         col_seq_id.push(seq_id);
                         col_extrinsic_block_number.push(event.block_number);
-                        col_extrinsic_index.push(event.extrinsic_index);
+                        col_extrinsic_index.push(extrinsic_index);
                         col_event_index.push(event.index);
                         col_data_path.push(data_path.to_owned());
                         col_block_time.push(event.block_time);
                     }
                     Err(err) => {
                         let msg = format!(
-                            "could extract path {:?} in event.data {:?}, got: {:?}",
+                            "could not extract path {:?} in event.data {:?}, got: {:?}",
                             data_path, e, err
                         );
                         error!("Extraction error: {:?}", msg);
@@ -303,12 +330,11 @@ pub async fn process_event_phase(
                             "
                                 UPDATE events
                                 SET error = $1
-                                WHERE block_number = $2 AND extrinsic_index = $3 AND index = $4;
+                                WHERE block_number = $2 AND index = $3;
                             ",
                         )
                         .bind(&msg)
                         .bind(event.block_number)
-                        .bind(event.extrinsic_index)
                         .bind(event.index)
                         .execute(db_pool)
                         .await?;
@@ -318,7 +344,7 @@ pub async fn process_event_phase(
             }
         }
 
-        sqlx::query(
+        let result = sqlx::query(
             "
                 INSERT INTO jobs(block_number, extrinsic_index, event_index, data_path, chain, address, seq_id, block_time)
                 SELECT
@@ -345,9 +371,148 @@ pub async fn process_event_phase(
         .bind(&col_block_time[..])
         .execute(db_pool)
         .await?;
+        crate::task_monitor::TASK_REGISTRY
+            .record_db_insert(crate::task_monitor::DbEntity::Job, result.rows_affected());
 
         debug!("Wrote {:?} jobs", col_extrinsic_block_number.len());
     }
 
     Ok(true)
+}
+
+/// A pending phase advance for a single event, produced by phase workers and
+/// drained by [`events_phase_update_flusher`].
+#[derive(Debug, Clone, Copy)]
+pub struct EventPhaseUpdate {
+    pub block_number: i64,
+    pub index: i32,
+    pub new_phase: i32,
+}
+
+pub type EventPhaseUpdateSender = async_channel::Sender<EventPhaseUpdate>;
+pub type EventPhaseUpdateReceiver = async_channel::Receiver<EventPhaseUpdate>;
+
+/// Channel for shipping per-event phase advances from workers to the
+/// batching flusher. Bounded so a slow flusher applies backpressure to the
+/// workers instead of letting the queue grow without bound.
+pub fn events_phase_update_channel() -> (EventPhaseUpdateSender, EventPhaseUpdateReceiver) {
+    async_channel::bounded(10_000)
+}
+
+/// Drain `EventPhaseUpdate`s and apply them as batched
+/// `UPDATE events FROM UNNEST(...)` writes. Flushes whichever comes first:
+/// `BATCH_SIZE` distinct `(block_number, index)` keys buffered, or
+/// `FLUSH_INTERVAL` elapsed since the first item of the current batch.
+///
+/// Conflict resolution: if the same `(block_number, index)` appears multiple
+/// times in a batch — typical when a single worker advances an event through
+/// several phases before the flusher fires — only the highest `new_phase` is
+/// written. The SQL `WHERE e.phase < u.new_phase` provides the same guarantee
+/// across batches.
+pub async fn events_phase_update_flusher(
+    rx: EventPhaseUpdateReceiver,
+    db_pool: Pool<Postgres>,
+    cancel_token: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    const BATCH_SIZE: usize = 1000;
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+    // Sentinel deadline used when the buffer is empty: setting it far in the
+    // future keeps the timer arm of the `select!` armed but inert until the
+    // first item arrives and a real flush deadline is set.
+    const IDLE: Duration = Duration::from_secs(3600);
+
+    let task_id = TASK_REGISTRY.start("Events phase update flusher", None);
+
+    // Key: (block_number, index). Value: highest `new_phase` observed.
+    let mut buffer: HashMap<(i64, i32), i32> = HashMap::new();
+    let mut deadline = tokio::time::Instant::now() + IDLE;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = cancel_token.cancelled() => {
+                if !buffer.is_empty() {
+                    flush_events_phase_updates(&db_pool, &mut buffer).await?;
+                }
+                break;
+            }
+
+            _ = tokio::time::sleep_until(deadline) => {
+                if !buffer.is_empty() {
+                    flush_events_phase_updates(&db_pool, &mut buffer).await?;
+                }
+                deadline = tokio::time::Instant::now() + IDLE;
+            }
+
+            result = rx.recv() => {
+                let update = match result {
+                    Ok(u) => u,
+                    Err(_) => {
+                        // All senders dropped — flush any remaining work and exit.
+                        if !buffer.is_empty() {
+                            flush_events_phase_updates(&db_pool, &mut buffer).await?;
+                        }
+                        break;
+                    }
+                };
+
+                let was_empty = buffer.is_empty();
+                buffer
+                    .entry((update.block_number, update.index))
+                    .and_modify(|p| *p = (*p).max(update.new_phase))
+                    .or_insert(update.new_phase);
+
+                // Start the flush window when transitioning from empty to non-empty.
+                if was_empty {
+                    deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+                }
+
+                if buffer.len() >= BATCH_SIZE {
+                    flush_events_phase_updates(&db_pool, &mut buffer).await?;
+                    deadline = tokio::time::Instant::now() + IDLE;
+                }
+            }
+        }
+    }
+
+    TASK_REGISTRY.end(task_id);
+    Ok(())
+}
+
+async fn flush_events_phase_updates(
+    db_pool: &Pool<Postgres>,
+    buffer: &mut HashMap<(i64, i32), i32>,
+) -> Result<(), anyhow::Error> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+
+    let n = buffer.len();
+    let mut block_numbers = Vec::with_capacity(n);
+    let mut indices = Vec::with_capacity(n);
+    let mut phases = Vec::with_capacity(n);
+
+    for ((block, idx), phase) in buffer.drain() {
+        block_numbers.push(block);
+        indices.push(idx);
+        phases.push(phase);
+    }
+
+    sqlx::query(
+        "UPDATE events e
+         SET phase = u.new_phase, error = NULL
+         FROM UNNEST($1::bigint[], $2::int[], $3::int[]) AS u(block_number, index, new_phase)
+         WHERE e.block_number = u.block_number
+           AND e.index = u.index
+           AND e.phase < u.new_phase",
+    )
+    .bind(&block_numbers[..])
+    .bind(&indices[..])
+    .bind(&phases[..])
+    .execute(db_pool)
+    .await?;
+
+    debug!("Flushed {} events phase updates", n);
+    Ok(())
 }

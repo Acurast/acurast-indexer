@@ -1,27 +1,48 @@
 indexer:
   archive_nodes:
-    - public-archive.mainnet.acurast.com
+    - wss://public-archive.mainnet.acurast.com
   index_finalized: true
   index_backwards: true
   index_phases: true
   index_from_block: 0
+  index_phases_from_block: 0
   index_from_epoch: 0
   num_workers_backwards: 8
   num_workers_gaps: 1
   num_workers_finalized: 2
-  num_workers_phases: 35
+  num_workers_phases: 15
   num_event_queuers: 5
-  num_conn_phases: 30
-  num_db_conn_phases: 60
-  max_blocks_per_bulk_insert: 100
-  # reprocess:
-  #   blocks:
-  #     - "0x9204531e0d72a019b3375320d153dda1dba5517ece9b95051e5b5ac9b137f775"
-  #   events:
-  #     - block_number: 8531510
-  #       extrinsic_index: 2
-  #       index: 5
-  #       phase: 1
+  num_conn_phases: 35
+  # Must stay above num_conn_phases (35), which bounds concurrent phase work.
+  # Cut from 60: the three pools together (API + phase + index) were configured
+  # for up to 175 connections against a server with max_connections=100, of which
+  # 3 are superuser-reserved. Pools are lazy so it only bit at peak -- as
+  # `FATAL: sorry, too many clients already`, which starves the INDEXER, not just
+  # the API. New total: 40 + 40 + 15 = 95 of 97 usable.
+  num_db_conn_phases: 40
+  max_events_per_bulk_insert: 10000
+  backpressure_threshold: 10000
+
+  # Storage-level pruning policies, applied independently of which rule
+  # produced the snapshot. Useful when several rules write to the same
+  # `(pallet, storage_location)` and you want one shared retention window.
+  # Runs alongside the per-rule `pruning` blocks below — whichever
+  # threshold catches a row first wins.
+  storage_pruning:
+    # System.Account snapshots are produced by the universal balance_*
+    # phase-3 rules and they accumulate fast (one per Deposit / Withdraw).
+    # Keep ~31 days at 6s blocks.
+    - pallet: 0 # System
+      storage_location: "Account"
+      strategy: keep_blocks
+      blocks: 446400 # 31 days at 6s blocks (31 * 24 * 600)
+    - pallet: 48 # AcurastCompute
+      storage_location: "Metrics"
+      blocks: 446400 # 31 days at 6s blocks (31 * 24 * 600)
+    - pallet: 48 # AcurastCompute
+      storage_location: "MetricsEpochSum"
+      blocks: 446400 # 31 days at 6s blocks (31 * 24 * 600)
+
   # Indexing rules - each rule defines:
   # - Which extrinsics trigger storage reads (at end of block)
   # - Which storage items to read
@@ -30,20 +51,20 @@ indexer:
     # Job Registration Tracking
     # ============================================
     - name: "job_registration_stored"
-      description: "Capture job details when registered"
+      description: "Capture job details when registered (covers register, register_with_min_metrics, deploy)"
 
       trigger:
         type: event
-        pallet: 40  # Acurast
-        variant: 9  # JobRegistrationStoredV2
+        pallet: 40 # Acurast
+        variant: 9 # JobRegistrationStoredV2
 
       storage:
         # Event structure: JobRegistrationStoredV2(JobId<T::AccountId>) where JobId = (MultiOrigin, JobIdSequence)
         - pallet: 40
           storage_location: "StoredJobRegistration"
           key_paths:
-            - "[0]"  # MultiOrigin (first part of JobId)
-            - "[1]"  # JobIdSequence (second part of JobId)
+            - "[0]" # MultiOrigin (first part of JobId)
+            - "[1]" # JobIdSequence (second part of JobId)
 
     # ============================================
     # Job Registration Removed
@@ -53,15 +74,52 @@ indexer:
 
       trigger:
         type: event
-        pallet: 40  # Acurast
-        variant: 1  # JobRegistrationRemoved
+        pallet: 40 # Acurast
+        variant: 1 # JobRegistrationRemoved
 
       storage:
         - pallet: 40
           storage_location: "StoredJobRegistration"
           key_paths:
-            - "[0]"  # MultiOrigin
-            - "[1]"  # JobIdSequence
+            - "[0]" # MultiOrigin
+            - "[1]" # JobIdSequence
+
+    # ============================================
+    # Universal Account snapshots on pallet_balances events (phase 3)
+    # ============================================
+    # Modern pallet_balances emits a Deposit on the receiver and a Withdraw
+    # on the sender for every Currency::transfer (plus the headline Transfer
+    # event). Combined, these two rules capture every free-balance change in
+    # the runtime — rewards, claims, vests, fees, commitments, delegations,
+    # slashes, conversions, cross-chain transfers — without each Acurast
+    # rule having to duplicate a System.Account snapshot.
+    - name: "balance_deposit_account"
+      description: "Snapshot the account that received funds whenever pallet_balances emits Deposit"
+      phase: 3
+      trigger:
+        type: event
+        pallet: 10 # Balances
+        variant: 7 # Deposit { who, amount }
+      storage:
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]" # who
+          value_path: "data"
+
+    - name: "balance_withdraw_account"
+      description: "Snapshot the account that lost funds whenever pallet_balances emits Withdraw"
+      phase: 3
+      trigger:
+        type: event
+        pallet: 10 # Balances
+        variant: 8 # Withdraw { who, amount }
+      storage:
+        - pallet: 0
+          storage_location: "Account"
+          key_paths:
+            - "[0]" # who
+          value_path: "data"
 
     # ============================================
     # Compute Pallet - Commitment Tracking
@@ -70,118 +128,84 @@ indexer:
       description: "Capture commitments and compute commitment metrics when committed"
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 9  # ComputeCommitted
+        pallet: 48 # AcurastCompute
+        variant: 9 # ComputeCommitted
       storage:
         # Commitments: StorageMap<CommitmentId, Commitment>
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - ""  # commitment_id at root
+            - "" # commitment_id at root
         # ComputeCommitments: StorageDoubleMap<CommitmentId, PoolId, Metric>
         # Using partial key to iterate all pools for this commitment
         - pallet: 48
           storage_location: "ComputeCommitments"
           key_paths:
-            - ""  # commitment_id at root (partial key, iterates pools)
-        # System::Account for committer's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "ORIGIN"  # committer who signed the tx
-          value_path: "data"
+            - "" # commitment_id at root (partial key, iterates pools)
 
     - name: "stake_more"
       description: "Capture commitment when staked more"
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 10  # StakedMore
+        pallet: 48 # AcurastCompute
+        variant: 10 # StakedMore
       storage:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - ""  # commitment_id at root
+            - "" # commitment_id at root
         - pallet: 48
           storage_location: "ComputeCommitments"
           key_paths:
-            - ""  # commitment_id at root (partial key, iterates pools)
-        # System::Account for committer's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "ORIGIN"  # committer who signed the tx
-          value_path: "data"
+            - "" # commitment_id at root (partial key, iterates pools)
 
     - name: "stake_more_metrics"
       description: "Capture compute commitment when staked more"
-      phase: 5
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 10  # StakedMore
+        pallet: 48 # AcurastCompute
+        variant: 10 # StakedMore
       storage:
         - pallet: 48
           storage_location: "ComputeCommitments"
           key_paths:
-            - ""  # commitment_id at root (partial key, iterates pools)
+            - "" # commitment_id at root (partial key, iterates pools)
 
     - name: "compute_commitment_cooldown_started"
       description: "Capture commitment when cooldown starts"
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 11  # ComputeCommitmentCooldownStarted
+        pallet: 48 # AcurastCompute
+        variant: 11 # ComputeCommitmentCooldownStarted
       storage:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - ""  # commitment_id at root
-        # System::Account for committer's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "ORIGIN"  # committer who signed the tx
-          value_path: "data"
+            - "" # commitment_id at root
 
     - name: "compute_commitment_ended"
       description: "Capture commitment when ended (stores it with null in commitment.stake)"
-      phase: 4
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 12  # ComputeCommitmentEnded
+        pallet: 48 # AcurastCompute
+        variant: 12 # ComputeCommitmentEnded
       storage:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - ""  # commitment_id at root (hex string like "0x7200")
-        # System::Account for committer's balance (unlocked stake)
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "ORIGIN"  # committer who signed the tx
-          value_path: "data"
+            - "" # commitment_id at root (hex string like "0x7200")
 
     - name: "slashed"
       description: "Capture commitment when slashed"
-      phase: 3  # Process during StorageIndexed3 since previously configured with wrong pallet/variant
       trigger:
         type: event
-        pallet: 48  # AcurastCompute
-        variant: 14  # Slashed
+        pallet: 48 # AcurastCompute
+        variant: 14 # Slashed
       storage:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - ""  # commitment_id at root
-        # System::Account for slashed account's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - ""  # commitment_id at root, to be used to lookup owner of commitment
-          transform: "CommitmentIdToCommitter"
-          value_path: "data"
+            - "" # commitment_id at root
 
     # ============================================
     # Compute Pallet - Delegation Tracking
@@ -198,14 +222,14 @@ indexer:
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance
-        - pallet: 0
-          storage_location: "Account"
+            - "[0]" # delegator
+            - "[1]" # commitment_id
+        # Refresh the commitment so its runtime-aggregated
+        # delegations_total_amount stays current for per-epoch totals.
+        - pallet: 48
+          storage_location: "Commitments"
           key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "delegated_more"
       description: "Capture delegation when delegated more"
@@ -219,14 +243,14 @@ indexer:
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance
-        - pallet: 0
-          storage_location: "Account"
+            - "[0]" # delegator
+            - "[1]" # commitment_id
+        # Refresh the commitment so its runtime-aggregated
+        # delegations_total_amount stays current for per-epoch totals.
+        - pallet: 48
+          storage_location: "Commitments"
           key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "delegation_cooldown_started"
       description: "Capture delegation when cooldown started"
@@ -240,14 +264,14 @@ indexer:
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance
-        - pallet: 0
-          storage_location: "Account"
+            - "[0]" # delegator
+            - "[1]" # commitment_id
+        # Refresh the commitment so its runtime-aggregated
+        # delegations_total_amount stays current for per-epoch totals.
+        - pallet: 48
+          storage_location: "Commitments"
           key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "delegation_ended"
       description: "Capture delegation when ended (stores null)"
@@ -261,14 +285,14 @@ indexer:
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance (unlocked)
-        - pallet: 0
-          storage_location: "Account"
+            - "[0]" # delegator
+            - "[1]" # commitment_id
+        # Refresh the commitment so its runtime-aggregated
+        # delegations_total_amount stays current for per-epoch totals.
+        - pallet: 48
+          storage_location: "Commitments"
           key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "redelegated"
       description: "Capture delegation, both old (stores null) and new, and both involved commitments"
@@ -282,27 +306,21 @@ indexer:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - "[1]"  # old_commitment_id
+            - "[1]" # old_commitment_id
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - "[2]"  # new_commitment_id
+            - "[2]" # new_commitment_id
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # old_commitment_id (for lookup deletion)
+            - "[0]" # delegator
+            - "[1]" # old_commitment_id (for lookup deletion)
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[2]"  # new_commitment_id (for lookup)
-        # System::Account for delegator's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[0]" # delegator
+            - "[2]" # new_commitment_id (for lookup)
 
     - name: "delegator_withdrew"
       description: "Capture delegation after withdrew"
@@ -316,15 +334,15 @@ indexer:
         - pallet: 48
           storage_location: "Delegations"
           key_paths:
-            - "[0]"  # delegator
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance (received rewards)
-        - pallet: 0
-          storage_location: "Account"
+            - "[0]" # delegator
+            - "[1]" # commitment_id
+        # Refresh the commitment so its runtime-aggregated
+        # delegations_total_amount stays current for per-epoch totals.
+        - pallet: 48
+          storage_location: "Commitments"
           key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
-    
+            - "[1]" # commitment_id
+
     - name: "committer_withdrew"
       description: "Capture commitment after committer withdrew"
       trigger:
@@ -337,13 +355,7 @@ indexer:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - "[1]"  # commitment_id
-        # System::Account for committer's balance (received rewards)
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[0]"  # committer
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "delegator_compounded"
       description: "Capture commitment after delegator compounded"
@@ -357,13 +369,7 @@ indexer:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - "[1]"  # commitment_id
-        # System::Account for delegator's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[0]"  # delegator
-          value_path: "data"
+            - "[1]" # commitment_id
 
     - name: "committer_compounded"
       description: "Capture commitment after committer compounded"
@@ -377,13 +383,7 @@ indexer:
         - pallet: 48
           storage_location: "Commitments"
           key_paths:
-            - "[1]"  # commitment_id
-        # System::Account for committer's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[0]"  # committer
-          value_path: "data"
+            - "[1]" # commitment_id
 
     # ============================================
     # Processor Metrics Tracking
@@ -406,30 +406,17 @@ indexer:
           key_paths:
             - "ORIGIN"
 
-      # Pruning configuration: keep only last 50000 blocks (~1 weeks at 6s block time)
-      # Snapshots older than this will be deleted periodically and won't be indexed during catchup
-      pruning:
-        strategy: keep_blocks
-        blocks: 100000
-
     - name: "manager_metrics_epoch_sum"
       description: "Capture the sum of pool metrics per manager"
-      phase: 3
       trigger:
         type: epoch
-
+      epoch_snapshot_at: "end" # Capture at end of epoch to get the sum after all updates in the epoch
       storage:
-        - pallet: 48  # AcurastCompute
+        - pallet: 48 # AcurastCompute
           storage_location: "MetricsEpochSum"
           # No key paths - iterates all entries, grouped by first key (commitment_id)
           # Each commitment_id gets its own row with {pool_id: metric, ...} as data
           group_by_first_key: true
-
-      # Pruning configuration: keep only last 50000 blocks (~1 weeks at 6s block time)
-      # Snapshots older than this will be deleted periodically and won't be indexed during catchup
-      pruning:
-        strategy: keep_blocks
-        blocks: 90000 # corresponds to 100 epochs
 
     # ============================================
     # Epoch Storage Reads
@@ -444,14 +431,13 @@ indexer:
         # StakeBasedRewards: StorageMap<PoolId, SlidingBuffer<Epoch, RewardBudget>>
         # RewardBudget contains target_weight_per_compute
         # Empty key_paths iterates all pool_ids
-        - pallet: 48  # AcurastCompute
+        - pallet: 48 # AcurastCompute
           storage_location: "StakeBasedRewards"
           key_paths: []
 
     - name: "total_issuance"
       description: "Capture total issuance at epoch start"
 
-      phase: 4
       trigger:
         type: epoch
       epoch_snapshot_at: "both" # Capture at both start and end of epoch to track changes within epoch (e.g. due to slashing)
@@ -460,83 +446,205 @@ indexer:
         # StakeBasedRewards: StorageMap<PoolId, SlidingBuffer<Epoch, RewardBudget>>
         # RewardBudget contains target_weight_per_compute
         # Empty key_paths iterates all pool_ids
-        - pallet: 10  # Balances
+        - pallet: 10 # Balances
           storage_location: "TotalIssuance"
           key_paths: []
-        - pallet: 10  # Balances
+        - pallet: 10 # Balances
           storage_location: "InactiveIssuance"
           key_paths: []
+
+    - name: "known_accounts"
+      description: >
+        Snapshot key accounts (Funder, Hyperdrive Bridge Token Vault) balance at each epoch end.
+
+      trigger:
+        type: epoch
+      epoch_snapshot_at: "end"
+      # Runs in a dedicated post-phase so bumping this triggers a backfill
+      # of the known-account balances across every historical epoch.
+      phase: 3
+
+      storage:
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x747f83e907bfecee52377542fc2f65181f224d59dcfd69eef059b1c3203f1501" # 5EhTHsee9Xtj89kXAnK9PxzEssXjD32evv95GtP8i68cR2sg Funder (AirDrop/Lootbox)
+          value_path: "data"
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x6d6f646c74727372797069640000000000000000000000000000000000000000" # 5EYCAe5jXu2x3jF1rfyz6MQUZUpgQb59Mk7tFCutXDL6aFYP Treasury
+          value_path: "data"
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x6d6f646c6f7072746e7069640000000000000000000000000000000000000000" # 5EYCAe5iXhV27TdQGKANjpKWqMirf6zwK1wcMJnQLwWfQggS Operational Funds
+          value_path: "data"
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x6d6f646c6c716474797069640000000000000000000000000000000000000000" # 5EYCAe5hvsoqffdSb4PcTPS5XpQGYaKGDsXPbYX1YCBSEB2J Liquidity Funds
+          value_path: "data"
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x6d6f646c65787472617069640000000000000000000000000000000000000000" # 5EYCAe5gXr27rgkx3s9NMoDEyGXzPHUEwLLV6SJZmrYWgv8B Extra Funds
+          value_path: "data"
+        - pallet: 0 # System
+          storage_location: "Account"
+          key_paths:
+            - "0x6d6f646c68797074766574680000000000000000000000000000000000000000" # 5EYCAe5h8kmzoNTSy1uhXr1rYkgpoGxKsFjxEXgW4qLN2w4M Hyperdrive Bridge Token Vault
+          value_path: "data"
 
     # ============================================
     # Token Claim Pallet - Claim & Vesting Tracking
     # ============================================
     - name: "token_claimed"
       description: "Capture claim info for legacy Claimed event"
-      phase: 3
       trigger:
         type: event
-        pallet: 55  # AcurastTokenClaim
-        variant: 0  # Claimed (legacy, may not be emitted)
+        pallet: 55 # AcurastTokenClaim
+        variant: 0 # Claimed (legacy, may not be emitted)
       storage:
         # Claimed: StorageMap<AccountId, ProcessedClaim>
         - pallet: 55
           storage_location: "Claimed"
           key_paths:
-            - "[0]"  # account (claimer)
-        # System::Account for claimer's balance
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[0]"  # account
-          value_path: "data"
+            - "[0]" # account (claimer)
 
     - name: "token_claimed_v2"
       description: "Capture claim and vesting info when ClaimedV2 event fires"
-      phase: 3
       trigger:
         type: event
-        pallet: 55  # AcurastTokenClaim
-        variant: 1  # ClaimedV2
+        pallet: 55 # AcurastTokenClaim
+        variant: 1 # ClaimedV2
       storage:
         # Claimed: StorageMap<AccountId, ProcessedClaim>
         - pallet: 55
           storage_location: "Claimed"
           key_paths:
-            - "[0]"  # claimer
+            - "[0]" # claimer
         # Vesting: StorageDoubleMap<destination, claimer, VestingInfo>
         - pallet: 55
           storage_location: "Vesting"
           key_paths:
-            - "[1]"  # destination
-            - "[0]"  # claimer
-        # System::Account for destination's balance after claim
-        - pallet: 0
-          storage_location: "Account"
-          key_paths:
-            - "[1]"  # destination
-          value_path: "data"
+            - "[1]" # destination
+            - "[0]" # claimer
 
     - name: "token_vested"
       description: "Capture vesting info after funds are unlocked"
-      phase: 3
       trigger:
         type: event
-        pallet: 55  # AcurastTokenClaim
-        variant: 2  # Vested
+        pallet: 55 # AcurastTokenClaim
+        variant: 2 # Vested
       storage:
         # Vesting: StorageDoubleMap<destination, claimer, VestingInfo>
         # May be deleted if fully vested (will store null)
         - pallet: 55
           storage_location: "Vesting"
           key_paths:
-            - "[1]"  # destination
-            - "[0]"  # claimer
-        # System::Account for destination's balance after vest
-        - pallet: 0
-          storage_location: "Account"
+            - "[1]" # destination
+            - "[0]" # claimer
+
+    # MultiClaimed / MultiVested target the acurast-token-claim MultiVesting
+    # NMap (keyed by (claim_type_id, destination, claimer)). Event field
+    # order is (claim_type_id, claimer, destination, ...) so key_paths
+    # reshuffles to match the storage-key order.
+    - name: "token_multi_claimed"
+      description: "Capture multi-vesting info when MultiClaimed event fires"
+      trigger:
+        type: event
+        pallet: 55 # AcurastTokenClaim
+        variant: 3 # MultiClaimed
+      storage:
+        - pallet: 55
+          storage_location: "MultiVesting"
           key_paths:
-            - "[1]"  # destination
-          value_path: "data"
+            - "[0]" # claim_type_id
+            - "[2]" # destination
+            - "[1]" # claimer
+
+    - name: "token_multi_vested"
+      description: "Capture multi-vesting info after multi-claim funds are unlocked"
+      trigger:
+        type: event
+        pallet: 55 # AcurastTokenClaim
+        variant: 4 # MultiVested
+      storage:
+        # MultiVesting entry may be deleted if fully vested (will store null)
+        - pallet: 55
+          storage_location: "MultiVesting"
+          key_paths:
+            - "[0]" # claim_type_id
+            - "[2]" # destination
+            - "[1]" # claimer
+
+    # ============================================
+    # Vesting Pallet - Per-account remaining lock
+    # ============================================
+    # pallet_vesting emits VestingUpdated{account, unvested} on every
+    # vest call, VestingCompleted{account} when the schedule finishes.
+    # `Vesting` storage is StorageMap<AccountId, BoundedVec<VestingInfo>>;
+    # the hook computes total remaining across schedules at the snapshot
+    # block. On VestingCompleted the storage entry is deleted (null
+    # snapshot) and the hook resets remaining_vesting to 0.
+    - name: "vesting_updated"
+      description: "Update accounts.remaining_vesting on pallet_vesting VestingUpdated"
+      trigger:
+        type: event
+        pallet: 15 # Vesting
+        variant: 0 # VestingUpdated { account, unvested }
+      storage:
+        - pallet: 15
+          storage_location: "Vesting"
+          key_paths:
+            - "[0]" # account
+
+    - name: "vesting_completed"
+      description: "Reset accounts.remaining_vesting on pallet_vesting VestingCompleted"
+      trigger:
+        type: event
+        pallet: 15 # Vesting
+        variant: 1 # VestingCompleted { account }
+      storage:
+        - pallet: 15
+          storage_location: "Vesting"
+          key_paths:
+            - "[0]" # account
+
+    # ============================================
+    # Acurast Pallet - Attestation Tracking (phase 4)
+    # ============================================
+    # Snapshots StoredAttestation when a processor's attestation is registered.
+    # Placed on phase 4 as a follow-up pass after the primary (phase 2) and
+    # balance follow-up (phase 3) passes.
+    - name: "attestation_stored"
+      description: "Capture attestation when stored (legacy AttestationStored event)"
+      phase: 4
+      trigger:
+        type: event
+        pallet: 40 # Acurast
+        variant: 3 # AttestationStored(Attestation, AccountId)
+      storage:
+        # StoredAttestation: StorageMap<AccountId, Attestation>
+        - pallet: 40
+          storage_location: "StoredAttestation"
+          key_paths:
+            - "[1]" # who (account)
+
+    - name: "attestation_stored_v2"
+      description: "Capture attestation when stored (modern AttestationStoredV2 event)"
+      phase: 4
+      trigger:
+        type: event
+        pallet: 40 # Acurast
+        variant: 11 # AttestationStoredV2(AccountId)
+      storage:
+        # StoredAttestation: StorageMap<AccountId, Attestation>
+        - pallet: 40
+          storage_location: "StoredAttestation"
+          key_paths:
+            - "" # single-field AccountId unwraps to root
 
   event_transformations:
     1:
@@ -571,26 +679,23 @@ indexer:
         variant: 2 # Reported
         data_path: "[0]" # Extract job_id
       - pallet: 43 # AcurastMarketplace
-        variant: 5 # AdvertisementRemoved
-        data_path: "[0]" # Extract account_id
-      - pallet: 43 # AcurastMarketplace
-        variant: 6 # ExecutionSuccess
+        variant: 5 # ExecutionSuccess
         data_path: "[0]" # Extract job_id
       - pallet: 43 # AcurastMarketplace
-        variant: 7 # ExecutionFailure
-        data_path: "" # job_id is in first field
+        variant: 6 # ExecutionFailure
+        data_path: "[0]" # job_id is in first field
       - pallet: 43 # AcurastMarketplace
-        variant: 8 # JobFinalized
-        data_path: "[0].job_id" # Extract job_id
+        variant: 7 # JobFinalized
+        data_path: "" # Extract job_id
       - pallet: 43 # AcurastMarketplace
-        variant: 9 # JobExecutionMatched
-        data_path: "" # ExecutionMatch struct
+        variant: 8 # JobExecutionMatched(ExecutionMatchFor)
+        data_path: "[0].job_id" # struct field — same shape as variant 0
       - pallet: 43 # AcurastMarketplace
-        variant: 10 # JobScriptEdited
-        data_path: "[0]" # Extract job_id
+        variant: 9 # JobScriptEdited(JobId)
+        data_path: "" # single-tuple JobId variant unwraps to root
       - pallet: 43 # AcurastMarketplace
-        variant: 11 # EditorTransferred
-        data_path: "" # job_id in first field
+        variant: 10 # EditorTransferred(JobId, AccountId)
+        data_path: "[0]" # job_id is the first tuple field
       - pallet: 43 # AcurastMarketplace
         variant: 13 # JobRegistrationMatchedV2
         data_path: ""
@@ -652,9 +757,14 @@ server:
   port: 8000
   host: 127.0.0.1
   query_timeout_seconds: 10
-  num_db_connections: 100
+  # Cut from 100 (see indexer.num_db_conn_phases for the budget). An API pool of
+  # 100 could never be useful anyway: the server has max_parallel_workers=8 in
+  # total, so beyond a handful of concurrent analytical queries the rest simply
+  # queue -- while still being able to exhaust max_connections and lock the
+  # indexer out.
+  num_db_connections: 40
 auth:
-  # Set via API_KEY environment variable
+  # Set via ACURAST_INDEXER__AUTH__API_KEY environment variable
   api_key: ""
 database:
   username: postgres

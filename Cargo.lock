@@ -13,6 +13,7 @@ dependencies = [
  "backoff",
  "base64 0.22.1",
  "bigdecimal",
+ "bs58",
  "chrono",
  "clap 4.5.31",
  "config",

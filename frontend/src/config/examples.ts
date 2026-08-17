@@ -55,6 +55,11 @@ export const examples: Record<string, Example> = {
     method: 'storageSnapshots',
     values: { config_rule: 'delegation_created', limit: 10 },
     description: 'Delegation storage snapshots'
+  },
+  baseRewardsManager: {
+    method: 'baseRewards',
+    values: { manager: '0x4c069e20ce75ac39ff13124faa3fef366e43cdecf677a85f8b7a376803d83ef5', limit: 10 },
+    description: 'Base rewards for all processors of a manager'
   }
 }
 

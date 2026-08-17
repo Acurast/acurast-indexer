@@ -1,18 +1,25 @@
-version: '3'
-
 services:
   app:
     build: .
     command: ["acurast-indexer", "-e", "local"]
     ports:
-      - 8000:8000
+      - 8001:8001
     volumes:
-      - ./configuration:/app/configuration
+      - ./configuration:/app/configuration:ro
     depends_on:
       db:
         condition: service_healthy
     env_file:
       - .env
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
   db:
     image: postgres:16
     volumes:
@@ -21,6 +28,11 @@ services:
       POSTGRES_DB: acurast
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+    # NOTE: no read_only / cap_drop ALL here — the official postgres entrypoint
+    # runs as root and drops to the postgres user via gosu (needs SETUID/SETGID)
+    # and writes to /run & /var/lib/postgresql, so those would break it.
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: pg_isready -U postgres
       interval: 3s
@@ -28,6 +40,10 @@ services:
       retries: 10
     ports:
       - "5433:5432"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   psql:

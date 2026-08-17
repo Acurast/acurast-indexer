@@ -16,6 +16,7 @@ import { useBatchStore, useFormStore } from '@/stores/formStore'
 import { useUIStore } from '@/stores/uiStore'
 import { useApiKey } from '@/hooks/useApiKey'
 import { useBatchRpcRequest } from '@/hooks/useRpcRequest'
+import { shellQuote } from '@/lib/shellQuote'
 import type { RpcResponse, BatchRequest } from '@/lib/types'
 import type { MethodKey } from '@/config/methods'
 
@@ -69,10 +70,10 @@ export function BatchSheet() {
     const rpcRequests = requests.map(r => r.request)
     const jsonStr = JSON.stringify(rpcRequests)
 
-    const curl = `curl -X POST '${window.location.origin}/api/v1/rpc' \\
-  -H 'Content-Type: application/json' \\
-  -H 'API-Key: ${key}' \\
-  -d '${jsonStr}'`
+    const curl = `curl -X POST ${shellQuote(`${window.location.origin}/api/v1/rpc`)} \\
+  -H ${shellQuote('Content-Type: application/json')} \\
+  -H ${shellQuote(`API-Key: ${key}`)} \\
+  -d ${shellQuote(jsonStr)}`
 
     await navigator.clipboard.writeText(curl)
     toast.success('Batch cURL copied!')

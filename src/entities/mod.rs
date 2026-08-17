@@ -66,6 +66,13 @@ impl From<ExtrinsicsIndexPhase> for u32 {
 
 /// Events index phase - flattened enum for simplicity.
 /// Serialized as: Created=0, JobsExtracted=1, StorageIndexed2=2, StorageIndexed3=3, StorageIndexed4=4
+///
+/// Phase 2 (StorageIndexed2) runs all event-triggered storage rules whose
+/// `phase` is 2 (the default). Phase 3 (StorageIndexed3) runs an extra pass
+/// for rules with `phase: 3` — used to layer follow-up storage captures
+/// (e.g. account balances) on top of the primary storage indexing.
+/// Phase 4 (StorageIndexed4) is a further follow-up pass for rules with
+/// `phase: 4` (e.g. attestations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[repr(i32)]
 pub enum EventsIndexPhase {
@@ -74,12 +81,11 @@ pub enum EventsIndexPhase {
     StorageIndexed2 = 2,
     StorageIndexed3 = 3,
     StorageIndexed4 = 4,
-    StorageIndexed5 = 5,
 }
 
 impl EventsIndexPhase {
     /// The maximum phase value (final phase)
-    pub const MAX: u32 = Self::StorageIndexed5 as u32;
+    pub const MAX: u32 = Self::StorageIndexed4 as u32;
 }
 
 impl Serialize for EventsIndexPhase {
@@ -108,9 +114,10 @@ impl From<i32> for EventsIndexPhase {
             1 => EventsIndexPhase::JobsExtracted,
             2 => EventsIndexPhase::StorageIndexed2,
             3 => EventsIndexPhase::StorageIndexed3,
-            4 => EventsIndexPhase::StorageIndexed4,
-            5 => EventsIndexPhase::StorageIndexed5,
-            _ => EventsIndexPhase::Created,
+            // Treat any value >= 4 as the final phase so events that the DB
+            // already marked as fully indexed at the previous MAX are still
+            // recognised as completed after a phase rollback.
+            _ => EventsIndexPhase::StorageIndexed4,
         }
     }
 }
@@ -127,6 +134,22 @@ impl From<EventsIndexPhase> for i32 {
     }
 }
 
+/// Block execution phase - which phase of block execution the event was emitted in.
+/// Maps to PostgreSQL enum `event_phase_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(type_name = "event_phase_type", rename_all = "PascalCase")]
+pub enum EventPhaseType {
+    ApplyExtrinsic,
+    Finalization,
+    Initialization,
+}
+
+impl Default for EventPhaseType {
+    fn default() -> Self {
+        Self::ApplyExtrinsic
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[repr(i32)]
 pub enum EpochIndexPhase {
@@ -134,12 +157,13 @@ pub enum EpochIndexPhase {
     EventsReady = 1,
     StorageIndexed2 = 2,
     StorageIndexed3 = 3,
-    StorageIndexed4 = 4,
+    AccountsMaterialized = 4,
+    EpochTotalsComputed = 5,
 }
 
 impl EpochIndexPhase {
     /// The maximum phase value (final phase)
-    pub const MAX: u32 = Self::StorageIndexed4 as u32;
+    pub const MAX: u32 = Self::EpochTotalsComputed as u32;
 }
 
 impl Serialize for EpochIndexPhase {
@@ -173,7 +197,8 @@ impl From<i32> for EpochIndexPhase {
             1 => EpochIndexPhase::EventsReady,
             2 => EpochIndexPhase::StorageIndexed2,
             3 => EpochIndexPhase::StorageIndexed3,
-            4 => EpochIndexPhase::StorageIndexed4,
+            4 => EpochIndexPhase::AccountsMaterialized,
+            5 => EpochIndexPhase::EpochTotalsComputed,
             _ => EpochIndexPhase::Raw,
         }
     }
@@ -204,19 +229,6 @@ pub struct SpecVersionChange {
     pub block_number: i64,
     pub block_time: DateTime<Utc>,
     pub block_hash: String,
-}
-
-#[derive(Serialize, Clone)]
-pub struct StorageSnapshot {
-    pub block_number: i64,
-    pub extrinsic_index: i32,
-    pub event_index: Option<i32>,
-    pub pallet: i32,
-    pub storage_location: String,
-    pub storage_keys: JsonValue,
-    pub data: JsonValue,
-    pub config_rule: String,
-    pub block_time: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow, Serialize, Clone, Debug)]
@@ -360,12 +372,13 @@ impl Extrinsic {
 #[derive(sqlx::FromRow, Serialize, Clone)]
 pub struct EventRow {
     pub block_number: i64,
-    pub extrinsic_index: i32,
+    pub extrinsic_index: Option<i32>, // NULL for system events (Finalization/Initialization)
     pub index: i32,
     pub pallet: i32,
     pub variant: i32,
     pub data: Option<JsonValue>,
     pub phase: EventsIndexPhase,
+    pub event_phase: EventPhaseType, // Block execution phase (ApplyExtrinsic/Finalization/Initialization)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub block_time: DateTime<Utc>,

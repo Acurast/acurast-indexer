@@ -1,28 +1,77 @@
+mod accounts_epoch;
+mod accounts_flags;
+mod attestations;
 mod commitments;
 mod custom_transforms;
+mod deployments;
 mod epoch;
+mod epoch_totals;
+mod parse;
 
+pub use accounts_epoch::process_epoch_accounts_materialization;
+pub use accounts_flags::{
+    flag_committer, flag_manager, flag_processor, processor_account_from_event,
+};
+pub use attestations::{find_unprocessed_attestation_snapshots, process_attestation_snapshot_ids};
 pub use commitments::{
     find_commitment_snapshots_at_block, find_unprocessed_commitment_snapshots,
     process_commitment_snapshot_ids, scan_all_commitments_at_block, CommitmentSnapshot,
 };
 pub use custom_transforms::apply_transform;
+pub use deployments::{process_job_registration_removed, process_job_registration_stored};
 pub use epoch::{process_epoch_storage_indexing, process_epoch_storage_rules_indexing};
+pub use epoch_totals::{compute_totals_at_block, process_epoch_totals, BlockTotals};
 
-use crate::config::{StorageIndexingRule, StorageIndexingTrigger, StoragePruning};
+use crate::config::{StorageIndexingRule, StorageIndexingTrigger, StorageLocationPruning};
 use crate::entities::{EventRow, ExtrinsicRow, ExtrinsicsIndexPhase};
 use crate::transformation::ValueWrapper;
+use crate::utils::ensure_hex_prefix;
 use anyhow::anyhow;
+use moka::future::Cache;
 use serde_json::json;
 use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use subxt::config::PolkadotConfig;
 use subxt::metadata::types::StorageEntryType;
 use subxt::utils::H256;
 use subxt::OnlineClient;
 use tracing::{debug, trace, warn};
+
+/// Cache for `block_number → epoch` lookups. Epochs are append-only and
+/// monotonic in `epoch_start`, so a hit for block N stays valid for the
+/// lifetime of the process: no future epoch can have `epoch_start ≤ N` that's
+/// higher than the one we already returned.
+static EPOCH_FOR_BLOCK: LazyLock<Cache<i64, i64>> =
+    LazyLock::new(|| Cache::builder().max_capacity(20_000).build());
+
+/// Return the epoch covering `block_number` (the highest epoch whose
+/// `epoch_start ≤ block_number`). `None` means no epoch has started yet at or
+/// before the block — callers should treat this as "not ready" rather than
+/// cache it.
+pub async fn epoch_for_block(
+    db_pool: &Pool<Postgres>,
+    block_number: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    if let Some(epoch) = EPOCH_FOR_BLOCK.get(&block_number).await {
+        return Ok(Some(epoch));
+    }
+
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT epoch FROM epochs WHERE epoch_start <= $1 ORDER BY epoch DESC LIMIT 1",
+    )
+    .bind(block_number)
+    .fetch_optional(db_pool)
+    .await?;
+
+    if let Some((epoch,)) = row {
+        EPOCH_FOR_BLOCK.insert(block_number, epoch).await;
+        Ok(Some(epoch))
+    } else {
+        Ok(None)
+    }
+}
 
 /// Simplified trigger kind for filtering rules (without the inner data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,26 +223,65 @@ impl FilteredStorageRules {
     }
 }
 
-/// Check if a block is within the pruning threshold for a rule
-pub fn is_block_within_pruning_threshold(
-    block_number: u32,
-    finalized_block: u32,
-    pruning: &Option<StoragePruning>,
-) -> bool {
-    match pruning {
-        Some(StoragePruning::KeepBlocks { blocks }) => {
-            let threshold = finalized_block.saturating_sub(*blocks);
-            block_number >= threshold
-        }
-        None => true, // No pruning configured, always process
+/// Returns true iff every storage item the rule would write is guaranteed
+/// to be pruned at this block by the global `storage_pruning` config.
+///
+/// Used at indexing time to skip processing rules whose output would be
+/// deleted on the next prune sweep — common during initial catch-up of a
+/// long block range when retention windows are short. The decision is
+/// per-rule, not per-item: if **any** of the rule's storage items would
+/// survive the prune, the rule still runs and writes that item (the
+/// to-be-pruned items are written too — wasted work, but they'll be
+/// deleted soon enough).
+pub fn rule_fully_pruned_at(rule: &StorageIndexingRule, block_number: u64, finalized: u64) -> bool {
+    let policies = &crate::config::settings().indexer.storage_pruning;
+    if policies.is_empty() || rule.storage.is_empty() {
+        return false;
     }
+    rule.storage.iter().all(|item| {
+        storage_item_pruned_at(
+            item.pallet,
+            &item.storage_location,
+            &rule.name,
+            block_number,
+            finalized,
+            policies,
+        )
+    })
+}
+
+fn storage_item_pruned_at(
+    pallet: u32,
+    storage_location: &str,
+    rule_name: &str,
+    block_number: u64,
+    finalized: u64,
+    policies: &[StorageLocationPruning],
+) -> bool {
+    for policy in policies {
+        if policy.pallet != pallet || policy.storage_location != storage_location {
+            continue;
+        }
+        if let Some(filter) = &policy.config_rule {
+            if filter != rule_name {
+                continue;
+            }
+        }
+        let threshold = finalized.saturating_sub(policy.blocks as u64);
+        if block_number < threshold {
+            return true;
+        }
+    }
+    false
 }
 
 /// Context for storage indexing - can represent either an event or extrinsic
 pub struct StorageIndexingContext<'a> {
     pub block_number: i64,
-    pub extrinsic_index: i32,
+    pub extrinsic_index: Option<i32>, // None for system events (Finalization/Initialization) or epoch-triggered
     pub event_index: Option<i32>,
+    pub epoch_index: Option<i64>, // For epoch-triggered snapshots: the epoch number
+    pub epoch_end: bool,          // True if snapshot is from last block of epoch
     pub data: Option<&'a JsonValue>,
     pub account_id: String,
     pub block_time: chrono::DateTime<chrono::Utc>,
@@ -227,58 +315,71 @@ fn apply_value_path(value: JsonValue, value_path: Option<&str>) -> JsonValue {
     }
 }
 
-/// Prune old storage snapshots based on rule configurations.
-/// Uses batched deletes to avoid long-running transactions that lock the database.
-pub async fn prune_storage_snapshots(
+/// Prune `storage_snapshots` rows by `(pallet, storage_location)` regardless
+/// of which rule created them. Configured via `indexer.storage_pruning` in
+/// the YAML config; an optional `config_rule` filter narrows the policy to
+/// a specific rule's output if the same storage location is captured by
+/// several rules with different retention needs.
+pub async fn prune_storage_snapshots_by_location(
     db_pool: &Pool<Postgres>,
-    storage_rules: &[StorageIndexingRule],
+    policies: &[StorageLocationPruning],
     finalized_block: u64,
     batch_size: i64,
 ) -> Result<u64, anyhow::Error> {
     let mut total_deleted = 0u64;
 
-    for rule in storage_rules {
-        if let Some(StoragePruning::KeepBlocks { blocks }) = &rule.pruning {
-            let threshold_block = finalized_block.saturating_sub(*blocks as u64) as i64;
+    for policy in policies {
+        let blocks = policy.blocks;
+        let threshold_block = finalized_block.saturating_sub(blocks as u64) as i64;
+        let target_label = policy
+            .config_rule
+            .as_deref()
+            .map(|r| format!("{}.{} (rule={})", policy.pallet, policy.storage_location, r))
+            .unwrap_or_else(|| format!("{}.{}", policy.pallet, policy.storage_location));
+
+        debug!(
+            "Pruning storage snapshots for {} older than block {} (keeping last {} blocks)",
+            target_label, threshold_block, blocks
+        );
+
+        // Delete in batches to avoid long-running transactions. The `$4`
+        // bind is the optional config_rule filter — when NULL we ignore it
+        // and prune across all rules at this storage location.
+        loop {
+            let result = sqlx::query(
+                r#"
+                DELETE FROM storage_snapshots
+                WHERE id IN (
+                    SELECT id FROM storage_snapshots
+                    WHERE pallet = $1
+                      AND storage_location = $2
+                      AND block_number < $3
+                      AND ($4::text IS NULL OR config_rule = $4)
+                    LIMIT $5
+                )
+                "#,
+            )
+            .bind(policy.pallet as i32)
+            .bind(&policy.storage_location)
+            .bind(threshold_block)
+            .bind(policy.config_rule.as_deref())
+            .bind(batch_size)
+            .execute(db_pool)
+            .await?;
+
+            let deleted = result.rows_affected();
+            total_deleted += deleted;
+
+            if deleted == 0 {
+                break;
+            }
 
             debug!(
-                "Pruning storage snapshots for rule '{}' older than block {} (keeping last {} blocks)",
-                rule.name, threshold_block, blocks
+                "Pruned {} storage snapshots for {} (total: {})",
+                deleted, target_label, total_deleted
             );
 
-            // Delete in batches to avoid long-running transactions
-            loop {
-                let result = sqlx::query(
-                    r#"
-                    DELETE FROM storage_snapshots
-                    WHERE id IN (
-                        SELECT id FROM storage_snapshots
-                        WHERE config_rule = $1 AND block_number < $2
-                        LIMIT $3
-                    )
-                    "#,
-                )
-                .bind(&rule.name)
-                .bind(threshold_block)
-                .bind(batch_size)
-                .execute(db_pool)
-                .await?;
-
-                let deleted = result.rows_affected();
-                total_deleted += deleted;
-
-                if deleted == 0 {
-                    break;
-                }
-
-                debug!(
-                    "Pruned {} storage snapshots for rule '{}' (total: {})",
-                    deleted, rule.name, total_deleted
-                );
-
-                // Small delay between batches to reduce database contention
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -338,15 +439,19 @@ pub async fn process_extrinsic_storage_indexing(
         };
 
         // Get block for storage queries
+        crate::utils::record_node_rpc_call();
         let block = client.blocks().at(block_hash).await?;
 
         // Create context for storage indexing
+        // Normalize account_id to ensure consistent 0x prefix for ORIGIN key_path
         let ctx = StorageIndexingContext {
             block_number: extrinsic.block_number,
-            extrinsic_index: extrinsic.index,
+            extrinsic_index: Some(extrinsic.index),
             event_index: None,
+            epoch_index: None,
+            epoch_end: false,
             data: extrinsic.data.as_ref(),
-            account_id: extrinsic.account_id.clone(),
+            account_id: ensure_hex_prefix(&extrinsic.account_id),
             block_time: extrinsic.block_time,
         };
 
@@ -354,13 +459,15 @@ pub async fn process_extrinsic_storage_indexing(
         process_storage_rules(worker_id, &ctx, &matching_rules, db_pool, client, &block).await?;
     }
 
-    // Update phase
-    sqlx::query("UPDATE extrinsics SET phase = $1 WHERE block_number = $2 AND index = $3;")
-        .bind(PHASE as i32)
-        .bind(extrinsic.block_number)
-        .bind(extrinsic.index)
-        .execute(db_pool)
-        .await?;
+    // Forward-only phase advance — see extrinsic_indexing.rs for the rationale.
+    sqlx::query(
+        "UPDATE extrinsics SET phase = $1 WHERE block_number = $2 AND index = $3 AND phase < $1;",
+    )
+    .bind(PHASE as i32)
+    .bind(extrinsic.block_number)
+    .bind(extrinsic.index)
+    .execute(db_pool)
+    .await?;
 
     Ok(())
 }
@@ -390,40 +497,36 @@ pub async fn process_events_storage_indexing(
     let event_rules: &[StorageIndexingRule] =
         crate::config::storage_rules().by_trigger_and_phase(TriggerKind::Event, target_phase);
 
-    // Find matching rule for this event (rules are already filtered to Event trigger type)
-    // Filter by target phase and pruning threshold
+    // Match by pallet and variant, then drop rules whose every storage
+    // item would be pruned by the global storage_pruning policy — saves
+    // catch-up work for blocks already past the retention window.
     let matching_rules: Vec<_> = event_rules
         .iter()
         .filter(|rule| {
-            // Match by pallet and variant indices directly
-            let matches_trigger = match &rule.trigger {
+            let trigger_matches = match &rule.trigger {
                 StorageIndexingTrigger::Event {
                     pallet, variant, ..
                 } => event.pallet == *pallet as i32 && event.variant == *variant as i32,
                 _ => false,
             };
-
-            // If trigger matches, check if block is within pruning threshold
-            if matches_trigger {
-                if let Some(finalized) = finalized_block {
-                    let within_threshold = is_block_within_pruning_threshold(
-                        event.block_number as u32,
-                        finalized,
-                        &rule.pruning,
+            if !trigger_matches {
+                return false;
+            }
+            if let Some(finalized) = finalized_block {
+                let pruned =
+                    rule_fully_pruned_at(rule, event.block_number as u64, finalized as u64);
+                if pruned {
+                    trace!(
+                        "Skipping storage rule '{}' for event {}-{:?}.{} - all items past retention",
+                        rule.name,
+                        event.block_number,
+                        event.extrinsic_index,
+                        event.index
                     );
-                    if !within_threshold {
-                        trace!(
-                            "Skipping storage rule '{}' for event {}-{}.{} since outside pruning threshold",
-                            rule.name,event.block_number,
-                event.extrinsic_index, event.index
-                        );
-                    }
-                    within_threshold
-                } else {
-                    true // No finalized block info, process anyway
                 }
+                !pruned
             } else {
-                false
+                true
             }
         })
         .cloned()
@@ -444,33 +547,41 @@ pub async fn process_events_storage_indexing(
                 &hex::decode(&b.hash).map_err(|e| anyhow!("Failed to decode block hash: {}", e))?,
             )
         } else {
-            return Err(anyhow!("Block not found in database for event {}-{}.{}, skipping event indexing (will be requeued when block known)",
+            return Err(anyhow!("Block not found in database for event {}-{:?}.{}, skipping event indexing (will be requeued when block known)",
                 event.block_number,
                 event.extrinsic_index,
                 event.index));
         };
 
         // Get the account_id from the extrinsic for ORIGIN key_path handling
-        let extrinsic_row: Option<(String,)> = sqlx::query_as(
-            "SELECT account_id FROM extrinsics WHERE block_number = $1 AND index = $2",
-        )
-        .bind(event.block_number)
-        .bind(event.extrinsic_index)
-        .fetch_optional(db_pool)
-        .await?;
-
-        let account_id = extrinsic_row.map(|e| e.0).unwrap_or_default();
+        // For system events (no extrinsic_index), account_id will be empty
+        let account_id = if let Some(ext_idx) = event.extrinsic_index {
+            let extrinsic_row: Option<(String,)> = sqlx::query_as(
+                "SELECT account_id FROM extrinsics WHERE block_number = $1 AND index = $2",
+            )
+            .bind(event.block_number)
+            .bind(ext_idx)
+            .fetch_optional(db_pool)
+            .await?;
+            extrinsic_row.map(|e| e.0).unwrap_or_default()
+        } else {
+            String::new() // System events have no associated extrinsic
+        };
 
         // Get block for storage queries
+        crate::utils::record_node_rpc_call();
         let block = client.blocks().at(block_hash).await?;
 
         // Create context for storage indexing
+        // Normalize account_id to ensure consistent 0x prefix for ORIGIN key_path
         let ctx = StorageIndexingContext {
             block_number: event.block_number,
             extrinsic_index: event.extrinsic_index,
             event_index: Some(event.index),
+            epoch_index: None,
+            epoch_end: false,
             data: event.data.as_ref(),
-            account_id,
+            account_id: ensure_hex_prefix(&account_id),
             block_time: event.block_time,
         };
 
@@ -481,12 +592,22 @@ pub async fn process_events_storage_indexing(
     Ok(())
 }
 
+/// Ensure a JSON string value has the 0x prefix (for data extracted via "" key_path)
+fn ensure_hex_prefix_json(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::String(s) => JsonValue::String(ensure_hex_prefix(&s)),
+        other => other,
+    }
+}
+
 /// Insert or update a storage snapshot (ON CONFLICT DO UPDATE)
 async fn insert_storage_snapshot(
     db_pool: &Pool<Postgres>,
     block_number: i64,
-    extrinsic_index: i32,
+    extrinsic_index: Option<i32>,
     event_index: Option<i32>,
+    epoch_index: Option<i64>,
+    epoch_end: bool,
     pallet: i32,
     storage_location: &str,
     storage_keys: JsonValue,
@@ -494,13 +615,12 @@ async fn insert_storage_snapshot(
     config_rule: &str,
     block_time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), anyhow::Error> {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
-        INSERT INTO storage_snapshots(block_number, extrinsic_index, event_index, pallet, storage_location, storage_keys, data, config_rule, block_time)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (block_number, extrinsic_index, event_index, pallet, storage_location, storage_keys) DO UPDATE
-        SET event_index = EXCLUDED.event_index,
-            data = EXCLUDED.data,
+        INSERT INTO storage_snapshots(block_number, extrinsic_index, event_index, epoch_index, epoch_end, pallet, storage_location, storage_keys, data, config_rule, block_time)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (block_number, extrinsic_index, event_index, epoch_index, epoch_end, pallet, storage_location, storage_keys) DO UPDATE
+        SET data = EXCLUDED.data,
             config_rule = EXCLUDED.config_rule,
             block_time = EXCLUDED.block_time
         "#,
@@ -508,6 +628,8 @@ async fn insert_storage_snapshot(
     .bind(block_number)
     .bind(extrinsic_index)
     .bind(event_index)
+    .bind(epoch_index)
+    .bind(epoch_end)
     .bind(pallet)
     .bind(storage_location)
     .bind(storage_keys)
@@ -516,14 +638,20 @@ async fn insert_storage_snapshot(
     .bind(block_time)
     .execute(db_pool)
     .await?;
+    crate::task_monitor::TASK_REGISTRY.record_db_insert(
+        crate::task_monitor::DbEntity::StorageSnapshot,
+        result.rows_affected(),
+    );
 
     trace!(
-        "Upserted storage snapshot for {}::{} at event {}-{}.{:?}",
+        "Upserted storage snapshot for {}::{} at block {} (extrinsic={:?}, event={:?}, epoch={:?}, epoch_end={})",
         pallet,
         storage_location,
         block_number,
         extrinsic_index,
-        event_index.map(|e| e.to_string()).unwrap_or_default()
+        event_index,
+        epoch_index,
+        epoch_end
     );
 
     Ok(())
@@ -550,7 +678,7 @@ pub async fn process_storage_rules<'a>(
 ) -> Result<(), anyhow::Error> {
     for rule in matching_rules {
         trace!(
-            "Processing storage rule '{}' for {}-{}.{:?}",
+            "Processing storage rule '{}' for {}-{:?}.{:?}",
             rule.name,
             ctx.block_number,
             ctx.extrinsic_index,
@@ -579,6 +707,7 @@ pub async fn process_storage_rules<'a>(
                                     vec![],
                                 );
 
+                                crate::utils::record_node_rpc_call();
                                 match block.storage().fetch(&storage_query).await {
                                     Ok(Some(value)) => {
                                         let scale_value = value.to_value()?;
@@ -594,6 +723,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             json!([0]), // 0 for StorageValue
@@ -615,6 +746,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             json!([0]),
@@ -663,7 +796,14 @@ pub async fn process_storage_rules<'a>(
                                 for key_path in key_paths.iter() {
                                     if key_path == "ORIGIN" {
                                         // Special case: use the extrinsic origin (account_id)
+                                        // account_id already has 0x prefix from block_processing
                                         key_json_values.push(json!(ctx.account_id.clone()));
+                                    } else if key_path.starts_with("0x") {
+                                        // Hex literal key (e.g. AccountId32) — no data extraction
+                                        key_json_values.push(json!(key_path));
+                                    } else if let Ok(n) = key_path.parse::<u64>() {
+                                        // Numeric literal key (e.g. pool_id) — no data extraction
+                                        key_json_values.push(json!(n));
                                     } else if let Some(data) = ctx.data {
                                         trace!(
                                             "Extracting key from data using path '{}': {:?}",
@@ -683,7 +823,13 @@ pub async fn process_storage_rules<'a>(
                                             }
                                         };
                                         if let Some(key_value) = values.first() {
-                                            key_json_values.push((*key_value).clone());
+                                            // For empty path (""), ensure consistent 0x prefix
+                                            let value = if key_path.is_empty() {
+                                                ensure_hex_prefix_json((*key_value).clone())
+                                            } else {
+                                                (*key_value).clone()
+                                            };
+                                            key_json_values.push(value);
                                         } else {
                                             // Empty result (e.g., from empty arrays) - skip silently
                                             break;
@@ -757,6 +903,7 @@ pub async fn process_storage_rules<'a>(
                                         dynamic_keys,
                                     );
 
+                                    crate::utils::record_node_rpc_call();
                                     match block.storage().fetch(&storage_query).await {
                                         Ok(Some(value)) => {
                                             let scale_value = value.to_value()?;
@@ -780,6 +927,8 @@ pub async fn process_storage_rules<'a>(
                                                 ctx.block_number,
                                                 ctx.extrinsic_index,
                                                 ctx.event_index,
+                                                ctx.epoch_index,
+                                                ctx.epoch_end,
                                                 storage_item.pallet as i32,
                                                 &storage_item.storage_location,
                                                 JsonValue::Array(key_json_values.clone()),
@@ -802,6 +951,8 @@ pub async fn process_storage_rules<'a>(
                                                 ctx.block_number,
                                                 ctx.extrinsic_index,
                                                 ctx.event_index,
+                                                ctx.epoch_index,
+                                                ctx.epoch_end,
                                                 storage_item.pallet as i32,
                                                 &storage_item.storage_location,
                                                 JsonValue::Array(key_json_values.clone()),
@@ -847,6 +998,7 @@ pub async fn process_storage_rules<'a>(
 
                                     // Collect all entries into an array
                                     let mut entries: Vec<JsonValue> = Vec::new();
+                                    crate::utils::record_node_rpc_call();
                                     let mut iter = block.storage().iter(storage_query).await?;
 
                                     while let Some(Ok(kv)) = iter.next().await {
@@ -922,6 +1074,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             JsonValue::Array(key_json_values.clone()),
@@ -943,6 +1097,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             JsonValue::Array(key_json_values.clone()),
@@ -971,6 +1127,7 @@ pub async fn process_storage_rules<'a>(
                                         String,
                                         (JsonValue, serde_json::Map<String, JsonValue>),
                                     > = std::collections::HashMap::new();
+                                    crate::utils::record_node_rpc_call();
                                     let mut iter = block.storage().iter(storage_query).await?;
 
                                     while let Some(Ok(kv)) = iter.next().await {
@@ -1036,6 +1193,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             json!([first_key_json]),
@@ -1061,6 +1220,7 @@ pub async fn process_storage_rules<'a>(
 
                                     // Collect all entries into an array
                                     let mut entries: Vec<JsonValue> = Vec::new();
+                                    crate::utils::record_node_rpc_call();
                                     let mut iter = block.storage().iter(storage_query).await?;
 
                                     while let Some(Ok(kv)) = iter.next().await {
@@ -1110,6 +1270,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             json!([]),
@@ -1131,6 +1293,8 @@ pub async fn process_storage_rules<'a>(
                                             ctx.block_number,
                                             ctx.extrinsic_index,
                                             ctx.event_index,
+                                            ctx.epoch_index,
+                                            ctx.epoch_end,
                                             storage_item.pallet as i32,
                                             &storage_item.storage_location,
                                             json!([]),

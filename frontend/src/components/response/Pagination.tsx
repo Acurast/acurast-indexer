@@ -6,6 +6,7 @@ import { useApiKey } from '@/hooks/useApiKey'
 import { useRpcRequest } from '@/hooks/useRpcRequest'
 import { useUIStore } from '@/stores/uiStore'
 import { methods } from '@/config/methods'
+import { buildRpcRequest } from '@/lib/buildRpcRequest'
 import type { RpcRequest, PagedResult } from '@/lib/types'
 
 interface PaginationProps {
@@ -36,64 +37,8 @@ export function Pagination({ result, onPageChange }: PaginationProps) {
   const methodConfig = methods[currentMethod]
 
   const buildRequest = (cursor: unknown): RpcRequest => {
-    // Get latest formValues from store to avoid closure issues
     const latestFormValues = useFormStore.getState().formValues
-    const params: Record<string, unknown> = {}
-    let simpleParam: string | null = null
-
-    methodConfig.fields.forEach(field => {
-      if (field.type === 'separator') return
-
-      const value = latestFormValues[field.name]
-      if (value === undefined || value === '' || value === null) return
-
-      let processedValue: unknown = value
-
-      if (field.type === 'number') {
-        processedValue = parseInt(value as string)
-      } else if (field.type === 'json') {
-        try {
-          processedValue = JSON.parse(value as string)
-        } catch {
-          processedValue = value
-        }
-      } else if (field.type === 'datetime') {
-        processedValue = new Date(value as string).toISOString()
-      }
-
-      if (field.isParam) {
-        simpleParam = processedValue as string
-      } else if (field.nested) {
-        if (!params[field.nested]) {
-          params[field.nested] = {}
-        }
-        const propName = field.name.split('.').pop()!
-        ;(params[field.nested] as Record<string, unknown>)[propName] = processedValue
-      } else {
-        params[field.name] = processedValue
-      }
-    })
-
-    // Clean up empty nested objects
-    Object.keys(params).forEach(key => {
-      if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
-        if (Object.keys(params[key] as object).length === 0) {
-          delete params[key]
-        }
-      }
-    })
-
-    // Add cursor (pass through as-is, server handles typing)
-    if (cursor !== null && cursor !== undefined) {
-      params.cursor = cursor
-    }
-
-    return {
-      jsonrpc: '2.0',
-      method: methodConfig.name,
-      params: simpleParam !== null ? simpleParam : params,
-      id: 1
-    }
+    return buildRpcRequest(methodConfig, latestFormValues, { cursor })
   }
 
   const executePage = async (cursor: unknown) => {

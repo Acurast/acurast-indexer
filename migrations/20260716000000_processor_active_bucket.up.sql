@@ -1,0 +1,21 @@
+-- ============================================
+-- PROCESSOR_ACTIVE_BUCKET
+-- Forward-collected membership backing getProcessorChurn. One row per
+-- (fixed calendar bucket, distinct heartbeat signer). Filled incrementally as
+-- each epoch reaches the totals step (see `collect_epoch_active_processors`):
+-- the epoch's distinct heartbeat signers (pallet 41 / event variant 6) are
+-- dedup-inserted into the calendar quarter and year bucket they fall in. The RPC
+-- then answers "distinct active processors in a bucket" with a trivial indexed
+-- count instead of ~100k random probes into the ~250M-row heartbeat index.
+--
+--   bucket_kind:  0 = calendar quarter, 1 = calendar year
+--   bucket_start: date_trunc('quarter'|'year', block_time) (UTC)
+--   account_id:   bare-hex extrinsics.account_id (no accounts/is_processor join,
+--                 so counts are complete regardless of flag backfill state)
+--
+-- The PK prefix (bucket_kind, bucket_start) already serves the count query, so
+-- no separate index is needed.
+-- ============================================
+
+-- Superseded by this table (the per-date precompute approach; unreleased).
+DROP TABLE IF EXISTS public.processor_churn;

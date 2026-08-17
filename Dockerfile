@@ -4,7 +4,7 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN cargo install cargo-chef --version 0.1.77
 
 # Build frontend
-FROM node:22-slim AS frontend-builder
+FROM node:24-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -30,10 +30,17 @@ RUN apt-get update -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Create a non-root user to run the app
+RUN groupadd --system --gid 1000 acurast \
+    && useradd --system --uid 1000 --gid acurast --no-create-home acurast
+
 WORKDIR /app
 COPY --from=builder /app/target/release/acurast-indexer /usr/local/bin/acurast-indexer
-COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
-COPY ./migrations ./migrations
-COPY ./configuration ./configuration
+COPY --from=frontend-builder --chown=acurast:acurast /app/frontend/dist ./frontend/dist
+COPY --chown=acurast:acurast ./migrations ./migrations
+COPY --chown=acurast:acurast ./configuration ./configuration
+
+USER acurast
+
 # set ENVIRONMENT to make dotenvy pick up the production config file
 CMD ["acurast-indexer"]

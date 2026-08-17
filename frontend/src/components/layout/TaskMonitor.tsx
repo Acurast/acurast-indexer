@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react'
 import { ChevronUp, ChevronDown, Activity, Loader2, Check } from 'lucide-react'
-import { useTaskStore, startTaskPolling, stopTaskPolling, type Task, type CurrentWork, type QueueTypeMetrics } from '@/stores/taskStore'
+import {
+  useTaskStore,
+  startTaskPolling,
+  stopTaskPolling,
+  type Task,
+  type CurrentWork,
+  type QueueTypeMetrics,
+  type BlockChannelMetrics,
+  type RangeMetric,
+} from '@/stores/taskStore'
+import { DbMetricsPanel, NodeMetricsPanel } from './ThroughputPanel'
 
 function formatElapsedTime(startTime: number): string {
   const elapsed = Date.now() - startTime
@@ -61,6 +71,90 @@ function pressureColor(pressure: number): string {
   if (pressure < 0.2) return 'bg-green-500'
   if (pressure < 0.5) return 'bg-yellow-500'
   return 'bg-red-500'
+}
+
+// Show pressure on the in-memory block-distribution channels (finalized,
+// priority, backwards). These don't have a "throughput" notion the way the
+// phase queues do — they just buffer BlockRefs for downstream block workers.
+// `softCeiling` is purely visual: the bar fills proportionally up to that
+// point, then stays at 100%. We pick a generous default that matches the
+// extrinsic-channel backpressure threshold (1000) so a "full" red bar
+// roughly corresponds to the gating point downstream.
+function BlockChannelsCard({
+  channels,
+  borderColor,
+  softCeiling = 1000,
+}: {
+  channels: BlockChannelMetrics[]
+  borderColor: string
+  softCeiling?: number
+}) {
+  return (
+    <div className={`bg-gray-800 rounded-lg p-2 border-l-4 ${borderColor}`}>
+      <div className="font-medium text-gray-200 text-xs">Block channels</div>
+      <div className="space-y-1 mt-1">
+        {channels.length === 0 ? (
+          <div className="text-gray-600 italic text-[10px]">No block channels yet</div>
+        ) : (
+          channels.map(c => {
+            const ratio = Math.min(c.pending / softCeiling, 1)
+            const colour =
+              ratio < 0.2 ? 'bg-green-500' : ratio < 0.5 ? 'bg-yellow-500' : 'bg-red-500'
+            return (
+              <div key={c.name}>
+                <div className="flex justify-between text-xs text-gray-400">
+                  <span className="capitalize">{c.name}</span>
+                  <span className="tabular-nums">{c.pending.toLocaleString()}</span>
+                </div>
+                <div className="h-1 bg-gray-700 rounded">
+                  <div
+                    className={`h-full rounded ${colour}`}
+                    style={{ width: `${ratio * 100}%` }}
+                  />
+                </div>
+              </div>
+            )
+          })
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Range cards: show the min/max block_number / epoch across recently active
+// worker tasks. Computed server-side from CurrentWork timestamps (30s window)
+// so a worker that stopped reporting drops out automatically.
+function RangeCard({
+  name,
+  range,
+  borderColor,
+}: {
+  name: string
+  range: RangeMetric<number> | undefined
+  borderColor: string
+}) {
+  return (
+    <div className={`bg-gray-800 rounded-lg p-2 border-l-4 ${borderColor}`}>
+      <div className="font-medium text-gray-200 text-xs">{name}</div>
+      {range ? (
+        <>
+          <div className="flex justify-between text-xs mt-1 tabular-nums">
+            <span className="text-gray-500">min</span>
+            <span className="text-gray-200">{range.min.toLocaleString()}</span>
+          </div>
+          <div className="flex justify-between text-xs tabular-nums">
+            <span className="text-gray-500">max</span>
+            <span className="text-gray-200">{range.max.toLocaleString()}</span>
+          </div>
+          <div className="text-[10px] text-gray-600 mt-0.5 tabular-nums">
+            span {(range.max - range.min).toLocaleString()}
+          </div>
+        </>
+      ) : (
+        <div className="text-gray-600 italic text-[10px] mt-1">no recent activity</div>
+      )}
+    </div>
+  )
 }
 
 function QueueCard({ name, metrics, borderColor }: { name: string; metrics: QueueTypeMetrics | undefined; borderColor: string }) {
@@ -145,7 +239,7 @@ function TaskItem({ task, showTimer = true }: { task: Task; showTimer?: boolean 
 }
 
 export function TaskMonitor() {
-  const { tasks, error, queueMetrics } = useTaskStore()
+  const { tasks, error, queueMetrics, metricsHistory } = useTaskStore()
   const [isExpanded, setIsExpanded] = useState(false)
 
   // Start polling on mount
@@ -172,7 +266,7 @@ export function TaskMonitor() {
           <div className="max-w-7xl mx-auto px-4 py-2">
             {/* Queue Metrics Panel */}
             {queueMetrics && (
-              <div className="border-b border-gray-700 pb-3 mb-3">
+              <div className="border-b border-gray-700 pb-3 mb-3 space-y-2">
                 <div className="grid grid-cols-3 gap-4">
                   <QueueCard
                     name="Events"
@@ -188,6 +282,34 @@ export function TaskMonitor() {
                     name="Epochs"
                     metrics={queueMetrics.epochs}
                     borderColor="border-purple-500"
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                  <BlockChannelsCard
+                    channels={queueMetrics.block_channels ?? []}
+                    borderColor="border-orange-500"
+                  />
+                  <RangeCard
+                    name="Blocks in flight"
+                    range={queueMetrics.block_range}
+                    borderColor="border-cyan-500"
+                  />
+                  <RangeCard
+                    name="Epochs in flight"
+                    range={queueMetrics.epoch_range}
+                    borderColor="border-fuchsia-500"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <DbMetricsPanel
+                    entities={queueMetrics.db?.entities ?? []}
+                    totalPerSec={queueMetrics.db?.total_rows_per_sec ?? 0}
+                    totalRows={queueMetrics.db?.total_rows ?? 0}
+                    history={metricsHistory}
+                  />
+                  <NodeMetricsPanel
+                    nodes={queueMetrics.nodes ?? []}
+                    history={metricsHistory}
                   />
                 </div>
               </div>

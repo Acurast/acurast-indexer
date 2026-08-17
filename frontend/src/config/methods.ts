@@ -74,9 +74,8 @@ export const methods: Record<string, MethodConfig> = {
     fields: [
       { name: 'block_from', type: 'number', label: 'Block From' },
       { name: 'block_to', type: 'number', label: 'Block To' },
-      { name: 'pallet', type: 'palletCombobox', label: 'Pallet', placeholder: 'Select or type...', metaType: 'extrinsics' },
-      { name: 'method', type: 'methodCombobox', label: 'Method', placeholder: 'Select or type...', palletField: 'pallet', metaType: 'extrinsics' },
-      { name: 'account_id', type: 'text', label: 'Account ID' }
+      { name: 'account_id', type: 'text', label: 'Account ID' },
+      { name: 'pairs', type: 'palletMethodPairs', label: '(Pallet, Method) pairs (OR’d)', metaType: 'extrinsics' }
     ]
   },
   extrinsicAddresses: {
@@ -111,10 +110,12 @@ export const methods: Record<string, MethodConfig> = {
       { name: 'data', type: 'json', label: 'Data (JSON)', placeholder: '{"field": "value"}' },
       { type: 'separator', name: '_sep_job', label: 'Job Filter' },
       { name: 'job', type: 'text', label: 'Job (SS58, hex, or with #seq_id)', placeholder: '5GrwvaEF...#123 or 0xd43593...' },
+      { type: 'separator', name: '_sep_source', label: 'Event Source' },
+      { name: 'source', type: 'select', label: 'Emitted by', options: ['', 'extrinsic', 'system'] },
       { type: 'separator', name: '_sep_options', label: 'Options' },
       { name: 'sort_order', type: 'select', label: 'Sort Order (by block number)', options: ['', 'asc', 'desc'] },
       { name: 'limit', type: 'number', label: 'Limit', default: 10 },
-      { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"block_number":...,"extrinsic_index":...,"index":...}' }
+      { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"block_number":...,"index":...}' }
     ]
   },
   event: {
@@ -122,8 +123,17 @@ export const methods: Record<string, MethodConfig> = {
     category: 'events',
     fields: [
       { name: 'block_number', type: 'number', label: 'Block Number', required: true, placeholder: 'e.g., 1234567' },
-      { name: 'extrinsic_index', type: 'number', label: 'Extrinsic Index', required: true, placeholder: 'e.g., 2' },
       { name: 'index', type: 'number', label: 'Event Index', required: true, placeholder: 'e.g., 0' }
+    ]
+  },
+  eventsCount: {
+    name: 'getEventsCount',
+    category: 'events',
+    fields: [
+      { name: 'block_from', type: 'number', label: 'Block From' },
+      { name: 'block_to', type: 'number', label: 'Block To' },
+      { name: 'source', type: 'select', label: 'Emitted by', options: ['', 'extrinsic', 'system'] },
+      { name: 'pairs', type: 'palletMethodPairs', label: '(Pallet, Variant) pairs (OR’d)', metaType: 'events' }
     ]
   },
   eventMetadata: {
@@ -153,6 +163,9 @@ export const methods: Record<string, MethodConfig> = {
       { name: 'data', type: 'json', label: 'Data (JSON)', placeholder: '{"field": "value"}' },
       { name: 'config_rule', type: 'configRuleCombobox', label: 'Config Rule', placeholder: 'Select rule...' },
       { name: 'exclude_deleted', type: 'checkbox', label: 'Exclude Deleted', default: false },
+      { type: 'separator', name: '_sep_epoch', label: 'Epoch Filters' },
+      { name: 'epoch_index', type: 'number', label: 'Epoch Index', placeholder: 'Filter by epoch (epoch-triggered snapshots)' },
+      { name: 'epoch_end', type: 'booleanSelect', label: 'Epoch End', placeholder: 'Filter start/end epoch snapshots' },
       { type: 'separator', name: '_sep1', label: 'Extrinsic Filters' },
       { name: 'extrinsic.pallet', type: 'palletCombobox', label: 'Extrinsic Pallet', placeholder: 'Select or type...', metaType: 'extrinsics', nested: 'extrinsic' },
       { name: 'extrinsic.method', type: 'methodCombobox', label: 'Extrinsic Method', placeholder: 'Select or type...', palletField: 'extrinsic.pallet', metaType: 'extrinsics', nested: 'extrinsic' },
@@ -163,11 +176,10 @@ export const methods: Record<string, MethodConfig> = {
       { type: 'separator', name: '_sep3', label: 'Sampling' },
       { name: 'include_epochs', type: 'checkbox', label: 'Include Epoch Info', default: false },
       { name: 'sample', type: 'select', label: 'Sample By', options: ['', 'per_epoch', 'day', 'week', 'month'] },
-      { name: 'fill', type: 'checkbox', label: 'Fill Missing', default: false },
       { type: 'separator', name: '_sep_options', label: 'Options' },
       { name: 'sort_order', type: 'select', label: 'Sort Order (by block number)', options: ['', 'asc', 'desc'] },
       { name: 'limit', type: 'number', label: 'Limit', default: 10 },
-      { name: 'cursor', type: 'number', label: 'Cursor', placeholder: 'e.g., 12345' }
+      { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"block_number":...,"id":...} (or epoch_bucket number when sample is set)' }
     ]
   },
   jobs: {
@@ -181,6 +193,25 @@ export const methods: Record<string, MethodConfig> = {
       { name: 'sort_order', type: 'select', label: 'Sort Order (by block number)', options: ['', 'asc', 'desc'] },
       { name: 'limit', type: 'number', label: 'Limit', default: 10 },
       { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"block_number":...,"index":...}' }
+    ]
+  },
+  deployments: {
+    name: 'getDeployments',
+    category: 'jobs',
+    fields: [
+      { name: 'account_id', type: 'text', label: 'Deployer Address', placeholder: '0x... or SS58 address' },
+      { name: 'seq_id', type: 'number', label: 'Sequence ID', placeholder: 'e.g., 12345' },
+      { name: 'is_active', type: 'booleanSelect', label: 'Active Status' },
+      { name: 'exclude_addresses', type: 'addressList', label: 'Exclude Addresses', placeholder: '0x... or SS58 address' },
+      { type: 'separator', name: '_sep_block', label: 'Block Range' },
+      { name: 'block_from', type: 'number', label: 'Block From' },
+      { name: 'block_to', type: 'number', label: 'Block To' },
+      { type: 'separator', name: '_sep_options', label: 'Ordering & Pagination' },
+      { name: 'related_extrinsics', type: 'checkbox', label: 'Include Related Extrinsics', default: false },
+      { name: 'order_by', type: 'select', label: 'Order By', options: ['', 'block_number', 'created_block_number', 'start_time'] },
+      { name: 'sort_order', type: 'select', label: 'Sort Order', options: ['', 'asc', 'desc'] },
+      { name: 'limit', type: 'number', label: 'Limit', default: 50 },
+      { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"seq_id":...,"val":...}' }
     ]
   },
   epochs: {
@@ -233,6 +264,27 @@ export const methods: Record<string, MethodConfig> = {
       { name: 'cursor', type: 'number', label: 'Cursor', placeholder: 'e.g., 9819' }
     ]
   },
+  processorChurn: {
+    name: 'getProcessorChurn',
+    category: 'managers',
+    fields: [
+      { name: 'as_of', type: 'date', label: 'As Of (date)', placeholder: 'YYYY-MM-DD; defaults to latest precomputed date' }
+    ]
+  },
+  baseRewards: {
+    name: 'getBaseRewards',
+    category: 'managers',
+    fields: [
+      { name: 'manager', type: 'text', label: 'Manager Address', required: true, placeholder: '0x... or SS58 (required)' },
+      { name: 'processor', type: 'text', label: 'Processor Address', placeholder: '0x... or SS58 (optional filter)' },
+      { name: 'epoch_from', type: 'number', label: 'Epoch From', placeholder: 'e.g., 3600' },
+      { name: 'epoch_to', type: 'number', label: 'Epoch To', placeholder: 'e.g., 3700' },
+      { type: 'separator', name: '_sep_options', label: 'Options' },
+      { name: 'limit', type: 'number', label: 'Limit', default: 50 },
+      { name: 'cursor_epoch', type: 'number', label: 'Cursor Epoch', placeholder: 'e.g., 3624' },
+      { name: 'cursor_processor', type: 'text', label: 'Cursor Processor', placeholder: '0x...' }
+    ]
+  },
   commitments: {
     name: 'getCommitments',
     category: 'staking',
@@ -269,6 +321,44 @@ export const methods: Record<string, MethodConfig> = {
       { name: 'sort_order', type: 'select', label: 'Sort Order', options: ['', 'asc', 'desc'] },
       { name: 'limit', type: 'number', label: 'Limit', default: 50 },
       { name: 'cursor', type: 'number', label: 'Cursor', placeholder: 'commitment_id' }
+    ]
+  },
+  accounts: {
+    name: 'getAccounts',
+    category: 'accounts',
+    fields: [
+      { name: 'sort', type: 'select', label: 'Sort By', options: ['total', 'total_with_locked', 'transferable', 'free', 'reserved', 'frozen'], default: 'total_with_locked', required: true },
+      { name: 'is_processor', type: 'booleanSelect', label: 'Is Processor' },
+      { name: 'is_manager', type: 'booleanSelect', label: 'Is Manager' },
+      { name: 'is_committer', type: 'booleanSelect', label: 'Is Committer' },
+      { name: 'processor_type', type: 'select', label: 'Processor Type', options: ['', 'Core', 'Lite', 'Unknown'] },
+      { name: 'device_type', type: 'select', label: 'Device Type', options: ['', 'iOS', 'Android', 'Unknown'] },
+      { name: 'account_id', type: 'text', label: 'Account ID', placeholder: '0x... or SS58 (optional filter)' },
+      { name: 'exclude_addresses', type: 'addressList', label: 'Exclude Addresses', placeholder: '0x... or SS58 address' },
+      { name: 'cursor', type: 'json', label: 'Cursor', placeholder: '{"sort_value":...,"account_id":...}' },
+      { name: 'limit', type: 'number', label: 'Limit', default: 100, placeholder: '1-100 (default 100)' }
+    ]
+  },
+  accountsCount: {
+    name: 'getAccountsCount',
+    category: 'accounts',
+    fields: [
+      { name: 'is_processor', type: 'booleanSelect', label: 'Is Processor' },
+      { name: 'is_manager', type: 'booleanSelect', label: 'Is Manager' },
+      { name: 'is_committer', type: 'booleanSelect', label: 'Is Committer' },
+      { name: 'processor_type', type: 'select', label: 'Processor Type', options: ['', 'Core', 'Lite', 'Unknown'] },
+      { name: 'device_type', type: 'select', label: 'Device Type', options: ['', 'iOS', 'Android', 'Unknown'] },
+      { name: 'account_id', type: 'text', label: 'Account ID', placeholder: '0x... or SS58 (optional filter)' },
+      { name: 'exclude_addresses', type: 'addressList', label: 'Exclude Addresses', placeholder: '0x... or SS58 address' }
+    ]
+  },
+  epochTotals: {
+    name: 'getEpochTotals',
+    category: 'epochs',
+    fields: [
+      { name: 'epoch_from', type: 'number', label: 'Epoch From', placeholder: 'e.g., 3600' },
+      { name: 'epoch_to', type: 'number', label: 'Epoch To', placeholder: 'e.g., 3700' },
+      { name: 'limit', type: 'number', label: 'Limit', default: 1000, placeholder: '1-5000 (default 1000)' }
     ]
   }
 }
